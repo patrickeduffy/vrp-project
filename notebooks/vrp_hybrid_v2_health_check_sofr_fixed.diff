@@ -1,0 +1,137 @@
+--- vrp_hybrid_v2_health_check.py
++++ vrp_hybrid_v2_health_check_sofr_fixed.py
+@@ -183,6 +183,13 @@
+ 
+ 
+ def _inspect_sofr(project_root: Path, runtime: dict[str, Any], target_date: pd.Timestamp) -> dict[str, Any]:
++    """Validate SOFR freshness using its normal publication lag.
++
++    At the close of an XNYS session, the target date's SOFR fixing has not yet
++    been published. The minimum expected observation is therefore the prior
++    completed XNYS session, not the target session itself and not an arbitrary
++    calendar-day allowance.
++    """
+     path = glob_latest(project_root, runtime["discovery"].get("sofr_cache", []))
+     row = {
+         "component": "sofr_cache",
+@@ -197,25 +204,111 @@
+         "recent_missing_count": None,
+         "missing_tenor_cells": None,
+         "duplicate_key_rows": None,
+-        "detail": "No SOFR cache located. The implied-variance updater may create it.",
++        "detail": "No SOFR cache located. The SOFR updater must refresh it before production.",
+     }
+     if path is None:
+         return row
++
+     try:
+         frame = read_table(path)
+-        date_col = first_existing_column(frame, ("date", "observation_date", "DATE"), required=False)
++        date_col = first_existing_column(
++            frame,
++            ("date", "observation_date", "DATE"),
++            required=False,
++        )
++        rate_col = first_existing_column(
++            frame,
++            ("SOFR", "sofr", "rate", "value"),
++            required=False,
++        )
+         if date_col is None:
+-            raise KeyError("No date column")
+-        dates = normalize_dates(frame[date_col]).dropna()
++            raise KeyError("No SOFR date column")
++        if rate_col is None:
++            raise KeyError("No SOFR rate column")
++
++        work = frame[[date_col, rate_col]].copy()
++        work["__date"] = normalize_dates(work[date_col])
++        work["__rate"] = pd.to_numeric(work[rate_col], errors="coerce")
++        work = work.loc[work["__date"].notna()].copy()
++
++        if work.empty:
++            raise RuntimeError("SOFR cache contains no valid observation dates.")
++
++        target_date = pd.Timestamp(target_date).normalize()
++        eligible = work.loc[work["__date"].le(target_date)].copy()
++        if eligible.empty:
++            raise RuntimeError(
++                f"SOFR cache contains no observation on or before {target_date.date()}."
++            )
++
++        duplicate_rows = int(
++            eligible.duplicated(["__date"], keep=False).sum()
++        )
++        invalid_rate_rows = int(
++            (
++                eligible["__rate"].isna()
++                | ~np.isfinite(eligible["__rate"])
++                | ~eligible["__rate"].between(-5.0, 25.0)
++            ).sum()
++        )
++
++        latest_eligible = eligible["__date"].max()
++        all_dates = work["__date"].dropna()
++        future_rows = int(work["__date"].gt(target_date).sum())
++
++        # The target is an XNYS session. At its EOD, the newest fixing that
++        # should already be published is the preceding XNYS session.
++        lookback_start = target_date - pd.Timedelta(days=21)
++        sessions = pd.DatetimeIndex(xnys_sessions(lookback_start, target_date))
++        if sessions.tz is not None:
++            sessions = sessions.tz_localize(None)
++        sessions = sessions.normalize()
++        prior_sessions = sessions[sessions < target_date]
++        if len(prior_sessions) == 0:
++            raise RuntimeError(
++                f"Could not resolve a prior XNYS session before {target_date.date()}."
++            )
++        expected_latest = pd.Timestamp(prior_sessions.max()).normalize()
++
++        missing_published_sessions = sessions[
++            (sessions > latest_eligible) & (sessions <= expected_latest)
++        ]
++        missing_published_count = int(len(missing_published_sessions))
++
+         row["row_count"] = int(len(frame))
+-        row["earliest_date"] = str(dates.min().date()) if len(dates) else None
+-        row["latest_date"] = str(dates.max().date()) if len(dates) else None
+-        age = int((target_date - dates.max()).days) if len(dates) else 9999
+-        row["status"] = "PASS" if age <= 10 else "STALE"
+-        row["detail"] = f"Latest SOFR observation is {age} calendar days before target; carry-forward is allowed."
++        row["earliest_date"] = str(all_dates.min().date())
++        row["latest_date"] = str(latest_eligible.date())
++        row["duplicate_key_rows"] = duplicate_rows
++        row["recent_missing_count"] = missing_published_count
++
++        hard_ok = (
++            duplicate_rows == 0
++            and invalid_rate_rows == 0
++            and latest_eligible >= expected_latest
++        )
++        row["status"] = "PASS" if hard_ok else "STALE"
++
++        calendar_age = int((target_date - latest_eligible).days)
++        detail_parts = [
++            f"latest_on_or_before_target={latest_eligible.date()}",
++            f"minimum_expected_published_observation={expected_latest.date()}",
++            f"calendar_age_days={calendar_age}",
++            f"missing_expected_sessions={missing_published_count}",
++            f"duplicate_rows={duplicate_rows}",
++            f"invalid_rate_rows={invalid_rate_rows}",
++            f"future_observations_ignored={future_rows}",
++        ]
++        if missing_published_count:
++            detail_parts.append(
++                "missing_session_examples="
++                + str([str(d.date()) for d in missing_published_sessions[:10]])
++            )
++        row["detail"] = "; ".join(detail_parts)
++
+     except Exception as exc:
+         row["status"] = "ERROR"
+         row["detail"] = f"Could not inspect SOFR cache: {exc}"
++
+     return row
+ 
+ 

@@ -1,0 +1,1100 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+from vrp_hybrid_v2_common import (
+    ACTIVE_TENORS,
+    DEFAULT_PROJECT_ROOT,
+    EXPECTED_TENORS,
+    LOCK_ID,
+    atomic_copy,
+    first_existing_column,
+    glob_latest,
+    load_json,
+    load_runtime_config,
+    normalize_dates,
+    normalize_tenor,
+    read_table,
+    resolve_path,
+    utc_now_iso,
+    write_csv_atomic,
+    write_json,
+    write_parquet_atomic,
+)
+
+EPS = 1e-12
+MODEL_SPEC = "unified_fds_no_min_return"
+TARGET_LOG_COL = "target_log_variance"
+LEAKAGE_DATE_COL = "last_forward_rv_date"
+BENCHMARK_CONTRACT_FEATURES = [
+    "candidate_log_downside_rv_5d",
+    "candidate_log_downside_rv_10d",
+    "candidate_log_downside_rv_21d",
+    "candidate_log_downside_rv_63d",
+    "candidate_downside_share_5d",
+    "candidate_downside_share_10d",
+    "candidate_max_abs_return_3d",
+    "candidate_max_abs_return_5d",
+    "candidate_max_abs_return_10d",
+]
+PARSIMONIOUS_FEATURES = [
+    "candidate_log_downside_rv_5d",
+    "candidate_log_downside_rv_21d",
+    "candidate_log_downside_rv_63d",
+    "candidate_downside_share_10d",
+    "candidate_max_abs_return_5d",
+    "candidate_max_abs_return_10d",
+]
+INTRADAY_FEATURES = [
+    "challenge_log_intraday_rv_5d",
+    "challenge_log_intraday_rv_21d",
+    "challenge_log_intraday_rv_63d",
+]
+MODEL_FEATURES = PARSIMONIOUS_FEATURES + INTRADAY_FEATURES
+LOCKED_FEATURES = MODEL_FEATURES
+RESEARCH_PERIOD_LABEL = "Research 2021-2024"
+RSI_PERIOD = 14
+
+
+@dataclass(frozen=True)
+class PublishConfig:
+    project_root: Path
+    runtime_config_path: Path
+    lock_config_path: Path
+    target_date: pd.Timestamp
+    approved_nav: float
+    feature_panel: Path
+    component_source: Path
+    forecast_benchmark: Path
+    locked_forecast_reference: Path
+    implied_variance: Path
+    spy_eod: Path
+    rv21d: Path
+    rsi_history: Path
+    fit_log: Path
+    staging_dir: Path
+    publish: bool
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build and publish the locked Hybrid v2 EOD signal outputs.")
+    parser.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT_ROOT)
+    parser.add_argument("--runtime-config", type=Path, default=None)
+    parser.add_argument("--lock-config", type=Path, default=None)
+    parser.add_argument("--target-date", required=True, help="YYYY-MM-DD or YYYYMMDD")
+    parser.add_argument("--approved-nav", type=float, default=1_000_000.0)
+    parser.add_argument("--feature-panel", type=Path, default=None)
+    parser.add_argument("--component-source", type=Path, default=None)
+    parser.add_argument("--forecast-benchmark", type=Path, default=None)
+    parser.add_argument("--locked-forecast-reference", type=Path, default=None)
+    parser.add_argument("--implied-variance", type=Path, default=None)
+    parser.add_argument("--spy-eod", type=Path, default=None)
+    parser.add_argument("--rv21d", type=Path, default=None)
+    parser.add_argument("--rsi-history", type=Path, default=None)
+    parser.add_argument("--fit-log", type=Path, default=None)
+    parser.add_argument("--staging-dir", type=Path, required=True)
+    parser.add_argument("--publish", action="store_true")
+    return parser.parse_args(argv)
+
+
+def _resolve_explicit_or_runtime(
+    explicit: Path | None,
+    project_root: Path,
+    runtime: dict[str, Any],
+    canonical_key: str | None = None,
+    discovery_key: str | None = None,
+) -> Path:
+    if explicit is not None:
+        path = explicit if explicit.is_absolute() else project_root / explicit
+        if not path.exists():
+            raise FileNotFoundError(path)
+        return path
+    if canonical_key:
+        path = resolve_path(project_root, runtime["canonical"][canonical_key])
+        assert path is not None
+        if path.exists():
+            return path
+    if discovery_key:
+        path = glob_latest(project_root, runtime["discovery"].get(discovery_key, []))
+        if path is not None:
+            return path
+    raise FileNotFoundError(f"Could not resolve input canonical_key={canonical_key} discovery_key={discovery_key}")
+
+
+def _numeric(frame: pd.DataFrame, column: str, label: str | None = None) -> pd.Series:
+    values = pd.to_numeric(frame[column], errors="coerce")
+    if values.isna().all():
+        raise RuntimeError(f"{label or column} contains no numeric values.")
+    return values
+
+
+def _select_intraday_raw_column(frame: pd.DataFrame) -> str:
+    preferred = (
+        "intraday_realized_variance_raw_sanitized",
+        "intraday_realized_variance_raw",
+        "intraday_variance_raw_sanitized",
+        "intraday_variance_raw",
+    )
+    column = first_existing_column(frame, preferred, required=False)
+    if column is not None:
+        return column
+
+    candidates: list[str] = []
+    for value in frame.columns:
+        name = str(value)
+        low = name.lower()
+        if "intraday" not in low or "variance" not in low:
+            continue
+        if any(token in low for token in ("forward", "target", "forecast", "cumulative")):
+            continue
+        if any(token in low for token in ("log_", "_log", "vol_pct", "annualized")):
+            continue
+        candidates.append(name)
+    raw_candidates = [column for column in candidates if "raw" in column.lower()]
+    resolved = raw_candidates or candidates
+    if len(resolved) != 1:
+        variance_like = [str(c) for c in frame.columns if "variance" in str(c).lower()]
+        raise RuntimeError(
+            "Could not resolve one non-forward raw intraday variance column from the Corsi component source. "
+            f"Candidates={resolved}; variance-like columns={variance_like[:50]}"
+        )
+    return resolved[0]
+
+
+def load_intraday_features(path: Path, target_date: pd.Timestamp) -> tuple[pd.DataFrame, pd.DataFrame]:
+    component = read_table(path)
+    component = component.loc[:, ~component.columns.duplicated(keep="last")].copy()
+    date_col = first_existing_column(component, ("date", "trade_date"), label="component date")
+    component["date"] = normalize_dates(component[date_col])
+    component = component.loc[
+        component["date"].notna() & component["date"].le(target_date)
+    ].copy()
+
+    source_col = _select_intraday_raw_column(component)
+    component[source_col] = pd.to_numeric(component[source_col], errors="coerce")
+
+    conflict_counts = component.groupby("date", dropna=False)[source_col].nunique(dropna=True)
+    conflicts = conflict_counts.loc[conflict_counts.gt(1)]
+    if not conflicts.empty:
+        raise RuntimeError(
+            "Corsi component source has conflicting raw intraday variance values across rows on the same date. "
+            f"Examples={[str(pd.Timestamp(d).date()) for d in conflicts.index[:10]]}"
+        )
+
+    daily = (
+        component[["date", source_col]]
+        .dropna(subset=["date", source_col])
+        .drop_duplicates("date", keep="last")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    if daily.empty:
+        raise RuntimeError(f"Corsi component source contains no usable rows through {target_date.date()}: {path}")
+    if (daily[source_col] < 0).any():
+        bad_dates = daily.loc[daily[source_col] < 0, "date"].head(10).dt.strftime("%Y-%m-%d").tolist()
+        raise RuntimeError(f"Raw intraday variance is negative on component dates: {bad_dates}")
+
+    audit_rows: list[dict[str, Any]] = []
+    for window, feature_col in ((5, INTRADAY_FEATURES[0]), (21, INTRADAY_FEATURES[1]), (63, INTRADAY_FEATURES[2])):
+        annualized = 252.0 * daily[source_col].rolling(window, min_periods=window).mean()
+        daily[feature_col] = np.log(annualized.clip(lower=EPS))
+        valid = daily.loc[daily[feature_col].notna(), ["date", feature_col]]
+        audit_rows.append({
+            "feature_column": feature_col,
+            "window_sessions": window,
+            "source_column": source_col,
+            "source_path": str(path),
+            "formula": f"log(252 * rolling_mean({source_col}, {window}))",
+            "available_dates": int(len(valid)),
+            "first_available_date": valid["date"].min() if len(valid) else pd.NaT,
+            "last_available_date": valid["date"].max() if len(valid) else pd.NaT,
+            "target_date_value": (
+                float(valid.loc[valid["date"].eq(target_date), feature_col].iloc[0])
+                if valid["date"].eq(target_date).any()
+                else np.nan
+            ),
+        })
+
+    latest = daily.loc[daily["date"].eq(target_date), INTRADAY_FEATURES]
+    if len(latest) != 1 or latest.isna().any().any():
+        nulls = latest.isna().sum().to_dict() if len(latest) else {c: 1 for c in INTRADAY_FEATURES}
+        raise RuntimeError(
+            f"Locked intraday rolling features are incomplete on {target_date.date()}. "
+            f"Component max date={daily['date'].max().date()}, rows_on_target={len(latest)}, nulls={nulls}"
+        )
+
+    return daily[["date"] + INTRADAY_FEATURES], pd.DataFrame(audit_rows)
+
+
+def load_feature_panel(
+    path: Path,
+    component_source: Path,
+    target_date: pd.Timestamp,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    frame = read_table(path)
+    frame = frame.loc[:, ~frame.columns.duplicated(keep="last")].copy()
+    date_col = first_existing_column(frame, ("date", "trade_date"), label="feature date")
+    tenor_col = first_existing_column(frame, ("tenor", "target_dte", "dte"), label="feature tenor")
+    frame["date"] = normalize_dates(frame[date_col])
+    frame["tenor"] = normalize_tenor(frame[tenor_col])
+    frame = frame.loc[
+        frame["date"].notna()
+        & frame["date"].le(target_date)
+        & frame["tenor"].isin(EXPECTED_TENORS)
+    ].copy()
+    frame["tenor"] = frame["tenor"].astype(int)
+    if LEAKAGE_DATE_COL not in frame.columns:
+        raise RuntimeError(f"Feature panel missing {LEAKAGE_DATE_COL}.")
+    frame[LEAKAGE_DATE_COL] = normalize_dates(frame[LEAKAGE_DATE_COL])
+    if TARGET_LOG_COL not in frame.columns:
+        fallback = first_existing_column(frame, ("log_forward_realized_variance_corsi",), required=False)
+        if fallback:
+            frame[TARGET_LOG_COL] = _numeric(frame, fallback)
+        else:
+            variance_col = first_existing_column(
+                frame,
+                ("forward_realized_variance_corsi", "target_realized_variance"),
+                required=False,
+            )
+            if variance_col is None:
+                raise RuntimeError("Feature panel has no usable target variance column.")
+            frame[TARGET_LOG_COL] = np.log(_numeric(frame, variance_col).clip(lower=EPS))
+
+    baseline_required = list(dict.fromkeys(BENCHMARK_CONTRACT_FEATURES + PARSIMONIOUS_FEATURES))
+    missing = [c for c in baseline_required if c not in frame.columns]
+    if missing:
+        raise RuntimeError(
+            "Baseline feature panel does not satisfy the locked benchmark-row contract. "
+            f"Missing={missing}."
+        )
+    for column in baseline_required + [TARGET_LOG_COL]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if frame.duplicated(["date", "tenor"]).any():
+        raise RuntimeError("Feature panel is not unique by date × tenor.")
+
+    intraday_daily, intraday_audit = load_intraday_features(component_source, target_date)
+    for feature_col in INTRADAY_FEATURES:
+        if feature_col in frame.columns:
+            frame = frame.drop(columns=[feature_col])
+    frame = frame.merge(intraday_daily, on="date", how="left", validate="many_to_one")
+
+    latest = frame.loc[frame["date"].eq(target_date)]
+    if set(latest["tenor"].astype(int)) != set(EXPECTED_TENORS):
+        raise RuntimeError(
+            f"Feature panel latest tenor grid is incomplete for {target_date.date()}: "
+            f"{sorted(latest['tenor'].dropna().astype(int).unique())}"
+        )
+    if latest[LOCKED_FEATURES].isna().any().any():
+        raise RuntimeError(
+            f"Locked feature values are incomplete on {target_date.date()}: "
+            f"{latest[LOCKED_FEATURES].isna().sum().to_dict()}"
+        )
+    for column in INTRADAY_FEATURES:
+        if latest[column].nunique(dropna=False) != 1:
+            raise RuntimeError(
+                f"Intraday feature {column} is not identical across all nine tenors on {target_date.date()}."
+            )
+    return frame.sort_values(["tenor", "date"]).reset_index(drop=True), intraday_audit
+
+
+def load_fit_log(path: Path) -> pd.DataFrame:
+    frame = pd.read_csv(path)
+    required = ["model_spec", "tenor", "test_year", "selected_alpha", "train_rows_used"]
+    missing = [c for c in required if c not in frame.columns]
+    if missing:
+        raise RuntimeError(f"Fit log missing columns: {missing}")
+    frame = frame.loc[frame["model_spec"].astype(str).eq(MODEL_SPEC)].copy()
+    for column in ["tenor", "test_year", "selected_alpha", "train_rows_used"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.loc[frame["tenor"].isin(EXPECTED_TENORS)].copy()
+    if frame.duplicated(["tenor", "test_year"]).any():
+        raise RuntimeError("Fit log is not unique by tenor × test year.")
+    return frame
+
+
+def load_forecast_benchmark_keys(path: Path, target_date: pd.Timestamp) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Locked forecast benchmark is missing: {path}")
+    frame = read_table(path)
+    date_col = first_existing_column(frame, ("date", "trade_date"), label="forecast benchmark date")
+    tenor_col = first_existing_column(frame, ("tenor", "target_dte", "dte"), label="forecast benchmark tenor")
+    keys = pd.DataFrame({
+        "date": normalize_dates(frame[date_col]),
+        "tenor": normalize_tenor(frame[tenor_col]),
+    })
+    keys = keys.loc[
+        keys["date"].notna()
+        & keys["date"].le(target_date)
+        & keys["tenor"].isin(EXPECTED_TENORS)
+    ].drop_duplicates(["date", "tenor"]).copy()
+    keys["tenor"] = keys["tenor"].astype(int)
+    if keys.empty or keys.duplicated(["date", "tenor"]).any():
+        raise RuntimeError("Locked forecast benchmark keys are empty or duplicated.")
+    return keys.sort_values(["tenor", "date"]).reset_index(drop=True)
+
+
+def build_locked_forecast_history(
+    features: pd.DataFrame,
+    fit_log: pd.DataFrame,
+    forecast_benchmark_keys: pd.DataFrame,
+    target_date: pd.Timestamp,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    forecasts: list[pd.DataFrame] = []
+    audit_rows: list[dict[str, Any]] = []
+    for tenor in EXPECTED_TENORS:
+        tenor_frame = features.loc[features["tenor"].eq(tenor)].sort_values("date").copy()
+        benchmark_dates = sorted(
+            forecast_benchmark_keys.loc[
+                forecast_benchmark_keys["tenor"].eq(tenor)
+                & forecast_benchmark_keys["date"].le(target_date),
+                "date",
+            ].unique()
+        )
+        benchmark_max = max(benchmark_dates) if benchmark_dates else pd.NaT
+        extension_dates = sorted(
+            tenor_frame.loc[
+                tenor_frame["date"].le(target_date)
+                & (tenor_frame["date"].gt(benchmark_max) if pd.notna(benchmark_max) else True),
+                "date",
+            ].unique()
+        )
+        test_dates_all = sorted(set(benchmark_dates).union(extension_dates))
+        available_fit_years = set(
+            pd.to_numeric(
+                fit_log.loc[fit_log["tenor"].eq(tenor), "test_year"], errors="coerce"
+            ).dropna().astype(int)
+        )
+        if int(target_date.year) not in available_fit_years:
+            raise RuntimeError(
+                f"No locked fit-log contract exists for {tenor}D/{target_date.year}. "
+                "A new calendar year requires an explicit versioned fit-log extension."
+            )
+        years = sorted({pd.Timestamp(d).year for d in test_dates_all}.intersection(available_fit_years))
+        for year in years:
+            test_start = pd.Timestamp(year=year, month=1, day=1)
+            next_start = pd.Timestamp(year=year + 1, month=1, day=1)
+            year_test_dates = [
+                pd.Timestamp(d) for d in test_dates_all
+                if test_start <= pd.Timestamp(d) < next_start and pd.Timestamp(d) <= target_date
+            ]
+            if not year_test_dates:
+                continue
+            fit_ref = fit_log.loc[fit_log["tenor"].eq(tenor) & fit_log["test_year"].eq(year)]
+            if len(fit_ref) != 1:
+                raise RuntimeError(
+                    f"Missing a unique canonical fit-log row for {tenor}D/{year}. "
+                    "A new calendar year requires an explicit locked fit contract."
+                )
+            ref = fit_ref.iloc[0]
+            alpha = float(ref["selected_alpha"])
+            required_rows = int(ref["train_rows_used"])
+
+            contract_train = tenor_frame.loc[
+                tenor_frame["date"].lt(test_start)
+                & tenor_frame[LEAKAGE_DATE_COL].notna()
+                & tenor_frame[LEAKAGE_DATE_COL].lt(test_start)
+            ].copy()
+            contract_train = contract_train.loc[
+                contract_train[BENCHMARK_CONTRACT_FEATURES + [TARGET_LOG_COL]].notna().all(axis=1)
+            ].copy()
+            raw_rows = len(contract_train)
+            if raw_rows < required_rows:
+                raise RuntimeError(
+                    f"Insufficient benchmark-contract training rows for {tenor}D/{year}: "
+                    f"available={raw_rows}, required={required_rows}."
+                )
+            contract_train = contract_train.tail(required_rows).copy()
+            if not contract_train[MODEL_FEATURES + [TARGET_LOG_COL]].notna().all(axis=1).all():
+                raise RuntimeError(
+                    f"The locked intraday model loses benchmark-contract training rows for {tenor}D/{year}."
+                )
+            test = tenor_frame.loc[tenor_frame["date"].isin(year_test_dates)].copy()
+            if len(test) != len(year_test_dates):
+                missing_dates = sorted(set(year_test_dates) - set(test["date"]))
+                raise RuntimeError(f"Feature panel misses locked test dates for {tenor}D/{year}: {missing_dates[:20]}")
+            if not test[MODEL_FEATURES].notna().all(axis=1).all():
+                bad = test.loc[~test[MODEL_FEATURES].notna().all(axis=1), "date"].tolist()
+                raise RuntimeError(f"The locked intraday model loses test rows for {tenor}D/{year}: {bad[:20]}")
+
+            estimator = Pipeline([
+                ("scale", StandardScaler()),
+                ("ridge", Ridge(alpha=alpha)),
+            ])
+            estimator.fit(contract_train[MODEL_FEATURES], contract_train[TARGET_LOG_COL])
+            predicted_log = estimator.predict(test[MODEL_FEATURES])
+            out = test[["date", "tenor"]].copy()
+            out["test_year"] = year
+            out["selected_alpha"] = alpha
+            out["train_rows_used"] = required_rows
+            out["predicted_log_variance_candidate"] = predicted_log
+            out["forecast_variance_candidate"] = np.exp(predicted_log)
+            out["forecast_vol_pct"] = 100.0 * np.sqrt(out["forecast_variance_candidate"])
+            out["forecast_model"] = "intraday_ridge_locked"
+            forecasts.append(out)
+            audit_rows.append({
+                "tenor": tenor,
+                "test_year": year,
+                "selected_alpha": alpha,
+                "raw_benchmark_contract_train_rows": raw_rows,
+                "train_rows_used": required_rows,
+                "train_first_date": contract_train["date"].min(),
+                "train_last_date": contract_train["date"].max(),
+                "test_rows": len(test),
+                "test_first_date": test["date"].min(),
+                "test_last_date": test["date"].max(),
+                "benchmark_contract_feature_count": len(BENCHMARK_CONTRACT_FEATURES),
+                "model_feature_count": len(MODEL_FEATURES),
+                "model_features": "|".join(MODEL_FEATURES),
+            })
+    if not forecasts:
+        raise RuntimeError("Locked forecast reconstruction produced no rows.")
+    result = pd.concat(forecasts, ignore_index=True).sort_values(["date", "tenor"]).reset_index(drop=True)
+    if result.duplicated(["date", "tenor"]).any():
+        raise RuntimeError("Locked forecast reconstruction is not unique by date × tenor.")
+    latest = result.loc[result["date"].eq(target_date)]
+    if set(latest["tenor"].astype(int)) != set(EXPECTED_TENORS):
+        raise RuntimeError(
+            f"Locked forecast reconstruction is incomplete on {target_date.date()}: "
+            f"{sorted(latest['tenor'].dropna().astype(int).unique())}"
+        )
+    return result, pd.DataFrame(audit_rows)
+
+
+def validate_locked_forecast_reference(
+    forecast: pd.DataFrame,
+    reference_path: Path,
+    tolerance: float = 1e-8,
+) -> dict[str, Any]:
+    if not reference_path.exists():
+        raise FileNotFoundError(f"Locked intraday forecast reference is missing: {reference_path}")
+    ref = read_table(reference_path)
+    model_col = first_existing_column(ref, ("model_name", "forecast_model"), required=False)
+    if model_col is not None:
+        ref = ref.loc[ref[model_col].astype(str).eq("intraday_ridge_locked")].copy()
+    date_col = first_existing_column(ref, ("date", "trade_date"), label="reference date")
+    tenor_col = first_existing_column(ref, ("tenor", "target_dte", "dte"), label="reference tenor")
+    log_col = first_existing_column(
+        ref,
+        ("predicted_log_variance_candidate", "predicted_log_variance", "forecast_log_variance"),
+        label="reference log forecast",
+    )
+    var_col = first_existing_column(
+        ref,
+        ("forecast_variance_candidate", "forecast_variance"),
+        label="reference variance forecast",
+    )
+    vol_col = first_existing_column(
+        ref,
+        ("candidate_forecast_vol_pct", "forecast_vol_pct", "forecast_volatility_pct"),
+        label="reference volatility forecast",
+    )
+    reference = pd.DataFrame({
+        "date": normalize_dates(ref[date_col]),
+        "tenor": normalize_tenor(ref[tenor_col]),
+        "ref_log": pd.to_numeric(ref[log_col], errors="coerce"),
+        "ref_var": pd.to_numeric(ref[var_col], errors="coerce"),
+        "ref_vol": pd.to_numeric(ref[vol_col], errors="coerce"),
+    }).dropna()
+    reference = reference.loc[reference["tenor"].isin(EXPECTED_TENORS)].copy()
+    reference["tenor"] = reference["tenor"].astype(int)
+    reference = reference.loc[reference["date"].le(forecast["date"].max())].copy()
+    if reference.empty or reference.duplicated(["date", "tenor"]).any():
+        raise RuntimeError("Locked intraday forecast reference is empty or duplicated by date × tenor.")
+    joined = reference.merge(
+        forecast[[
+            "date", "tenor", "predicted_log_variance_candidate",
+            "forecast_variance_candidate", "forecast_vol_pct",
+        ]],
+        on=["date", "tenor"],
+        how="left",
+        validate="one_to_one",
+    )
+    if joined[["predicted_log_variance_candidate", "forecast_variance_candidate", "forecast_vol_pct"]].isna().any().any():
+        missing = joined.loc[joined["predicted_log_variance_candidate"].isna(), ["date", "tenor"]]
+        raise RuntimeError(
+            f"Reconstructed forecast misses locked reference keys: {missing.head(20).to_dict(orient='records')}"
+        )
+    diffs = {
+        "predicted_log_variance_candidate": float(
+            (joined["predicted_log_variance_candidate"] - joined["ref_log"]).abs().max()
+        ),
+        "forecast_variance_candidate": float(
+            (joined["forecast_variance_candidate"] - joined["ref_var"]).abs().max()
+        ),
+        "forecast_vol_pct": float((joined["forecast_vol_pct"] - joined["ref_vol"]).abs().max()),
+    }
+    if any(value > tolerance for value in diffs.values()):
+        raise RuntimeError(
+            f"Locked intraday forecast reconstruction differs from reference beyond {tolerance}: {diffs}"
+        )
+    return {
+        "reference_path": str(reference_path),
+        "compared_rows": int(len(joined)),
+        "tolerance": tolerance,
+        "max_abs_differences": diffs,
+        "reference_date_start": str(reference["date"].min().date()),
+        "reference_date_end": str(reference["date"].max().date()),
+    }
+
+
+def load_implied_variance(path: Path, target_date: pd.Timestamp) -> pd.DataFrame:
+    frame = read_table(path)
+    date_col = first_existing_column(frame, ("date", "trade_date"), label="implied-variance date")
+    tenor_col = first_existing_column(frame, ("tenor", "target_dte", "dte", "target_days"), label="implied-variance tenor")
+    frame = frame.copy()
+    frame["date"] = normalize_dates(frame[date_col])
+    frame["tenor"] = normalize_tenor(frame[tenor_col])
+    frame = frame.loc[frame["date"].notna() & frame["date"].le(target_date) & frame["tenor"].isin(EXPECTED_TENORS)].copy()
+    frame["tenor"] = frame["tenor"].astype(int)
+    variance_col = first_existing_column(
+        frame,
+        (
+            "implied_variance",
+            "implied_variance_final",
+            "vix_style_variance",
+            "interpolated_variance",
+            "target_variance",
+            "annualized_variance",
+        ),
+        required=False,
+    )
+    vol_col = first_existing_column(
+        frame,
+        (
+            "implied_vol_pct",
+            "vix_style_vol",
+            "vix_style_volatility",
+            "target_vol",
+            "volatility",
+        ),
+        required=False,
+    )
+    if variance_col is None and vol_col is None:
+        raise RuntimeError("Implied-variance panel has neither variance nor volatility column.")
+    if variance_col is not None:
+        frame["implied_variance"] = pd.to_numeric(frame[variance_col], errors="coerce")
+    else:
+        vol = pd.to_numeric(frame[vol_col], errors="coerce")
+        decimal_vol = vol / 100.0 if vol.dropna().median() > 2.0 else vol
+        frame["implied_variance"] = decimal_vol.pow(2)
+    frame["implied_vol_pct"] = 100.0 * np.sqrt(frame["implied_variance"])
+    frame = frame[["date", "tenor", "implied_variance", "implied_vol_pct"]].copy()
+    if frame.duplicated(["date", "tenor"]).any():
+        dup = frame.duplicated(["date", "tenor"], keep=False)
+        disagreement = frame.loc[dup].groupby(["date", "tenor"])["implied_variance"].nunique(dropna=False).gt(1)
+        if disagreement.any():
+            raise RuntimeError("Implied-variance panel has conflicting duplicate keys.")
+        frame = frame.drop_duplicates(["date", "tenor"], keep="last")
+    if (frame["implied_variance"] <= 0).any() or frame["implied_variance"].isna().any():
+        raise RuntimeError("Implied variance must be positive and complete.")
+    latest = frame.loc[frame["date"].eq(target_date)]
+    if set(latest["tenor"].astype(int)) != set(EXPECTED_TENORS):
+        raise RuntimeError(f"Implied-variance panel is incomplete on {target_date.date()}.")
+    return frame.sort_values(["date", "tenor"]).reset_index(drop=True)
+
+
+def load_spy_eod(path: Path, target_date: pd.Timestamp) -> pd.DataFrame:
+    frame = read_table(path)
+    date_col = first_existing_column(frame, ("date", "trade_date"), label="SPY date")
+    close_col = first_existing_column(frame, ("close", "spy_close", "close_price"), label="SPY close")
+    out = pd.DataFrame({
+        "date": normalize_dates(frame[date_col]),
+        "spy_close": pd.to_numeric(frame[close_col], errors="coerce"),
+    })
+    out = out.loc[out["date"].notna() & out["date"].le(target_date)].drop_duplicates("date", keep="last").sort_values("date")
+    if out["spy_close"].isna().any() or (out["spy_close"] <= 0).any():
+        raise RuntimeError("SPY close history contains invalid values.")
+    if out["date"].max() != target_date:
+        raise RuntimeError(f"SPY EOD history ends {out['date'].max().date()}, target is {target_date.date()}.")
+    return out.reset_index(drop=True)
+
+
+def load_accepted_wilder_rsi(
+    path: Path,
+    target_date: pd.Timestamp,
+    accepted_versions: list[str],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Accepted Wilder RSI history is missing: {path}")
+    frame = read_table(path)
+    date_col = first_existing_column(frame, ("trade_date", "date"), label="RSI date")
+    rsi_col = first_existing_column(frame, ("spy_wilder_rsi14", "rsi14"), label="RSI value")
+    close_col = first_existing_column(frame, ("spy_close", "close"), label="RSI close")
+    version_col = first_existing_column(frame, ("rsi_formula_version", "rsi_version"), label="RSI formula version")
+    out = pd.DataFrame({
+        "date": normalize_dates(frame[date_col]),
+        "spy_close": pd.to_numeric(frame[close_col], errors="coerce"),
+        "rsi14": pd.to_numeric(frame[rsi_col], errors="coerce"),
+        "rsi_formula_version": frame[version_col].astype("string"),
+    })
+    out = out.loc[out["date"].notna() & out["date"].le(target_date)].copy()
+    if out.duplicated("date").any():
+        raise RuntimeError("Accepted Wilder RSI history is not unique by date.")
+    versions = sorted(out["rsi_formula_version"].dropna().astype(str).unique())
+    disallowed = sorted(set(versions) - set(accepted_versions))
+    if disallowed:
+        raise RuntimeError(f"Accepted Wilder RSI history contains disallowed formula versions: {disallowed}")
+    latest = out.loc[out["date"].eq(target_date)]
+    if len(latest) != 1:
+        raise RuntimeError(
+            f"Accepted Wilder RSI history does not contain exactly one row for {target_date.date()}: rows={len(latest)}"
+        )
+    if latest[["spy_close", "rsi14"]].isna().any().any():
+        raise RuntimeError("Accepted Wilder RSI latest row contains missing close or RSI.")
+    if not out["rsi14"].dropna().between(0.0, 100.0, inclusive="both").all():
+        raise RuntimeError("Accepted Wilder RSI contains values outside [0,100].")
+    audit = {
+        "source": str(path),
+        "accepted_versions": accepted_versions,
+        "observed_versions": versions,
+        "rows": int(len(out)),
+        "date_start": str(out["date"].min().date()),
+        "date_end": str(out["date"].max().date()),
+        "latest_rsi": float(latest["rsi14"].iloc[0]),
+    }
+    return out.sort_values("date").reset_index(drop=True), audit
+
+
+def load_rv21d(path: Path, target_date: pd.Timestamp) -> pd.DataFrame:
+    frame = read_table(path)
+    date_col = first_existing_column(frame, ("date", "trade_date"), label="RV21D date")
+    rv_col = first_existing_column(
+        frame,
+        ("rv21d_vol_pct", "rv21d_vol_pct_final", "realized_vol_21d", "spy_vol_21d_pct", "rv_21d_pct"),
+        label="RV21D value",
+    )
+    out = pd.DataFrame({
+        "date": normalize_dates(frame[date_col]),
+        "rv21d_vol_pct": pd.to_numeric(frame[rv_col], errors="coerce"),
+    })
+    out = out.loc[out["date"].notna() & out["date"].le(target_date)].drop_duplicates("date", keep="last").sort_values("date")
+    if out["date"].max() != target_date:
+        raise RuntimeError(f"RV21D history ends {out['date'].max().date()}, target is {target_date.date()}.")
+    if out["rv21d_vol_pct"].isna().any() or (out["rv21d_vol_pct"] <= 0).any():
+        raise RuntimeError("RV21D history contains invalid values.")
+    return out.reset_index(drop=True)
+
+
+def expand_lock_tables(lock: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    release = lock.get("release_id") or lock.get("lock_id")
+    if release != LOCK_ID:
+        raise RuntimeError(f"Wrong production config: expected={LOCK_ID}, observed={release}")
+    threshold_rows: list[dict[str, Any]] = []
+    for row in lock.get("core_thresholds", []):
+        threshold_rows.append({
+            "layer": "Core", "bucket": row["bucket"], "tenor": int(row["tenor"]),
+            "threshold_vrp": float(row["vrp_log"]), "threshold_z3": float(row["z_3m"]),
+            "threshold_z1": float(row["z_1y"]), "threshold_rsi": float(row["rsi_cap"]),
+            "threshold_rv": float(row["rv21d_floor"]),
+        })
+    for row in lock.get("secondary_thresholds", []):
+        for tenor in row["tenors"]:
+            threshold_rows.append({
+                "layer": "Secondary", "bucket": row["bucket"], "tenor": int(tenor),
+                "threshold_vrp": float(row["vrp_log"]), "threshold_z3": float(row["z_3m"]),
+                "threshold_z1": float(row["z_1y"]), "threshold_rsi": float(row["rsi_cap"]),
+                "threshold_rv": float(row["rv21d_floor"]),
+            })
+    thresholds = pd.DataFrame(threshold_rows)
+    sizes = pd.DataFrame(lock.get("sizes", []))[['layer', 'bucket', 'tenor', 'size_pct_nav']].copy()
+    sizes["tenor"] = sizes["tenor"].astype(int)
+    expected_keys = 13
+    if len(thresholds) != expected_keys or len(sizes) != expected_keys:
+        raise RuntimeError(f"Lock must contain exactly 13 active threshold and size rows; got {len(thresholds)} and {len(sizes)}")
+    return thresholds, sizes
+
+
+def load_static_tiebreaks(project_root: Path, runtime: dict[str, Any]) -> pd.DataFrame:
+    canonical_value = runtime.get("canonical", {}).get("static_tiebreaks")
+    canonical_path = resolve_path(project_root, canonical_value) if canonical_value else None
+    if canonical_path is not None and canonical_path.exists():
+        frame = pd.read_csv(canonical_path)
+        required = [
+            "layer", "bucket", "tenor", "continuous_quality_score",
+            "research_sleeve_win_rate_pct", "research_sleeve_worst_1pct_mean_return",
+        ]
+        if not all(column in frame.columns for column in required):
+            raise RuntimeError(f"Canonical static tie-break file is missing columns: {sorted(set(required)-set(frame.columns))}")
+        out = frame[required].copy()
+        out["tenor"] = pd.to_numeric(out["tenor"], errors="raise").astype(int)
+        if len(out) != 13 or out.duplicated(["layer", "bucket", "tenor"]).any():
+            raise RuntimeError("Canonical static tie-break file must contain 13 unique sleeve rows.")
+        if out[required[3:]].isna().any().any():
+            raise RuntimeError("Canonical static tie-break file contains missing metrics.")
+        return out.sort_values(["layer", "bucket", "tenor"]).reset_index(drop=True)
+
+    candidate_path = glob_latest(project_root, runtime["discovery"].get("selection_candidate_panel", []))
+    if candidate_path is not None:
+        frame = read_table(candidate_path)
+        required = [
+            "layer", "bucket", "tenor", "continuous_quality_score",
+            "research_sleeve_win_rate_pct", "research_sleeve_worst_1pct_mean_return",
+        ]
+        if all(c in frame.columns for c in required):
+            out = frame[required].drop_duplicates(["layer", "bucket", "tenor"], keep="last").copy()
+            if len(out) == 13:
+                out["tenor"] = out["tenor"].astype(int)
+                return out
+    sizing_path = glob_latest(project_root, runtime["discovery"].get("continuous_sizing", []))
+    metrics_path = glob_latest(project_root, runtime["discovery"].get("period_metrics", []))
+    if sizing_path is None or metrics_path is None:
+        raise RuntimeError(
+            "Locked static tie-break metrics were not found. Expected either the locked selection candidate panel "
+            "or both continuous-sizing and period-metrics audit CSVs."
+        )
+    sizing = pd.read_csv(sizing_path)
+    metrics = pd.read_csv(metrics_path)
+    period_col = first_existing_column(metrics, ("period", "sample_period"), label="period label")
+    metrics = metrics.loc[metrics[period_col].astype(str).eq(RESEARCH_PERIOD_LABEL)].copy()
+    quality_col = first_existing_column(sizing, ("continuous_quality_score",), label="quality score")
+    win_col = first_existing_column(metrics, ("win_rate_pct",), label="research win rate")
+    tail_col = first_existing_column(metrics, ("worst_1pct_mean_return",), label="research worst 1%")
+    quality = sizing[["layer", "bucket", "tenor", quality_col]].rename(columns={quality_col: "continuous_quality_score"})
+    research = metrics[["layer", "bucket", "tenor", win_col, tail_col]].rename(columns={
+        win_col: "research_sleeve_win_rate_pct",
+        tail_col: "research_sleeve_worst_1pct_mean_return",
+    })
+    out = quality.merge(research, on=["layer", "bucket", "tenor"], how="inner", validate="one_to_one")
+    if len(out) != 13:
+        raise RuntimeError(f"Static tie-break table has {len(out)} rows; expected 13.")
+    out["tenor"] = out["tenor"].astype(int)
+    return out
+
+
+def compute_vrp_and_zscores(forecast: pd.DataFrame, implied: pd.DataFrame) -> pd.DataFrame:
+    merged = forecast.merge(implied, on=["date", "tenor"], how="inner", validate="one_to_one")
+    merged["model_vrp_log"] = np.log(merged["implied_variance"] / merged["forecast_variance_candidate"])
+    merged = merged.sort_values(["tenor", "date"]).reset_index(drop=True)
+    pieces: list[pd.DataFrame] = []
+    for tenor, group in merged.groupby("tenor", sort=True):
+        group = group.sort_values("date").copy()
+        prior = group["model_vrp_log"].shift(1)
+        mean63 = prior.rolling(63, min_periods=63).mean()
+        std63 = prior.rolling(63, min_periods=63).std(ddof=1)
+        mean252 = prior.rolling(252, min_periods=252).mean()
+        std252 = prior.rolling(252, min_periods=252).std(ddof=1)
+        group["z_3m"] = (group["model_vrp_log"] - mean63) / std63
+        group["z_1y"] = (group["model_vrp_log"] - mean252) / std252
+        group["prior_63_rows"] = prior.rolling(63, min_periods=1).count().astype(int)
+        group["prior_252_rows"] = prior.rolling(252, min_periods=1).count().astype(int)
+        pieces.append(group)
+    return pd.concat(pieces, ignore_index=True).sort_values(["date", "tenor"]).reset_index(drop=True)
+
+
+def _failure_reasons(row: pd.Series, prefix: str) -> str:
+    rule_exists = bool(row.get(f"{prefix}_rule_exists", False))
+    if not rule_exists:
+        return "inactive"
+    reasons: list[str] = []
+    checks = [
+        ("vrp", row["model_vrp_log"], row[f"{prefix}_threshold_vrp"], ">"),
+        ("z3", row["z_3m"], row[f"{prefix}_threshold_z3"], ">"),
+        ("z1", row["z_1y"], row[f"{prefix}_threshold_z1"], ">"),
+        ("rsi", row["rsi14"], row[f"{prefix}_threshold_rsi"], "<"),
+        ("rv", row["rv21d_vol_pct"], row[f"{prefix}_threshold_rv"], ">"),
+    ]
+    for label, value, threshold, op in checks:
+        if pd.isna(value):
+            reasons.append(f"{label}:missing")
+        elif op == ">" and not value > threshold:
+            reasons.append(f"{label}<={threshold:g}")
+        elif op == "<" and not value < threshold:
+            reasons.append(f"{label}>={threshold:g}")
+    return "PASS" if not reasons else "; ".join(reasons)
+
+
+def apply_lock(
+    signal: pd.DataFrame,
+    thresholds: pd.DataFrame,
+    sizes: pd.DataFrame,
+    tiebreaks: pd.DataFrame,
+    approved_nav: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    base = signal.copy()
+    for layer in ["Core", "Secondary"]:
+        prefix = layer.lower()
+        rule = thresholds.loc[thresholds["layer"].eq(layer)].rename(columns={
+            "bucket": f"{prefix}_bucket",
+            "threshold_vrp": f"{prefix}_threshold_vrp",
+            "threshold_z3": f"{prefix}_threshold_z3",
+            "threshold_z1": f"{prefix}_threshold_z1",
+            "threshold_rsi": f"{prefix}_threshold_rsi",
+            "threshold_rv": f"{prefix}_threshold_rv",
+        }).drop(columns="layer")
+        base = base.merge(rule, on="tenor", how="left", validate="many_to_one")
+        base[f"{prefix}_rule_exists"] = base[f"{prefix}_bucket"].notna()
+        layer_size_map = (
+            sizes.loc[sizes["layer"].eq(layer), ["tenor", "size_pct_nav"]]
+            .drop_duplicates("tenor", keep="last")
+            .set_index("tenor")["size_pct_nav"]
+            .to_dict()
+        )
+        base[f"{prefix}_size_pct_nav"] = base["tenor"].map(layer_size_map)
+        base[f"{prefix}_pass"] = (
+            base[f"{prefix}_rule_exists"]
+            & base["model_vrp_log"].gt(base[f"{prefix}_threshold_vrp"])
+            & base["z_3m"].gt(base[f"{prefix}_threshold_z3"])
+            & base["z_1y"].gt(base[f"{prefix}_threshold_z1"])
+            & base["rsi14"].lt(base[f"{prefix}_threshold_rsi"])
+            & base["rv21d_vol_pct"].gt(base[f"{prefix}_threshold_rv"])
+        )
+        base[f"{prefix}_failure_reason"] = base.apply(lambda row: _failure_reasons(row, prefix), axis=1)
+
+    candidates: list[pd.DataFrame] = []
+    for layer in ["Core", "Secondary"]:
+        prefix = layer.lower()
+        frame = base.loc[base[f"{prefix}_pass"]].copy()
+        if frame.empty:
+            continue
+        frame["layer"] = layer
+        frame["bucket"] = frame[f"{prefix}_bucket"]
+        candidates.append(frame)
+    if candidates:
+        candidate_panel = pd.concat(candidates, ignore_index=True)
+        candidate_panel = candidate_panel.merge(sizes, on=["layer", "bucket", "tenor"], how="left", validate="many_to_one")
+        candidate_panel = candidate_panel.merge(tiebreaks, on=["layer", "bucket", "tenor"], how="left", validate="many_to_one")
+        required = ["size_pct_nav", "continuous_quality_score", "research_sleeve_win_rate_pct", "research_sleeve_worst_1pct_mean_return"]
+        if candidate_panel[required].isna().any().any():
+            raise RuntimeError("Candidate panel is missing locked sizing or tie-break values.")
+        candidate_panel["layer_priority"] = candidate_panel["layer"].eq("Core").astype(int)
+        candidate_panel["target_max_risk_dollars"] = approved_nav * candidate_panel["size_pct_nav"]
+        for metric in ["vrp", "z3", "z1", "rsi", "rv"]:
+            candidate_panel[f"threshold_{metric}"] = np.where(
+                candidate_panel["layer"].eq("Core"),
+                candidate_panel[f"core_threshold_{metric}"],
+                candidate_panel[f"secondary_threshold_{metric}"],
+            )
+        candidate_panel["selection_reason"] = (
+            "highest locked size; ties: Core, continuous quality, research win rate, "
+            "research worst-1% tail, longer DTE"
+        )
+        candidate_panel = candidate_panel.sort_values(
+            [
+                "date", "size_pct_nav", "layer_priority", "continuous_quality_score",
+                "research_sleeve_win_rate_pct", "research_sleeve_worst_1pct_mean_return", "tenor",
+            ],
+            ascending=[True, False, False, False, False, False, False],
+            kind="mergesort",
+        )
+        selected = candidate_panel.drop_duplicates("date", keep="first").copy()
+    else:
+        candidate_panel = pd.DataFrame()
+        selected = pd.DataFrame()
+
+    all_dates = pd.DataFrame({"date": sorted(base["date"].dropna().unique())})
+    if selected.empty:
+        decisions = all_dates.copy()
+        decisions["decision_status"] = "NO_TRADE"
+    else:
+        decision_cols = [
+            "date", "layer", "bucket", "tenor", "size_pct_nav", "target_max_risk_dollars",
+            "implied_variance", "implied_vol_pct", "forecast_variance_candidate", "forecast_vol_pct",
+            "model_vrp_log", "z_3m", "z_1y", "rsi14", "rv21d_vol_pct",
+            "continuous_quality_score", "research_sleeve_win_rate_pct",
+            "research_sleeve_worst_1pct_mean_return",
+            "threshold_vrp", "threshold_z3", "threshold_z1", "threshold_rsi", "threshold_rv",
+            "selection_reason",
+        ]
+        decisions = all_dates.merge(selected[decision_cols], on="date", how="left", validate="one_to_one")
+        decisions["decision_status"] = np.where(decisions["tenor"].notna(), "TRADE", "NO_TRADE")
+    decisions["lock_id"] = LOCK_ID
+    decisions["selection_rule"] = "revised_size_benchmark"
+    decisions["approved_nav_dollars"] = approved_nav
+
+    selected_marker = decisions.loc[decisions["decision_status"].eq("TRADE"), ["date", "layer", "tenor"]].copy()
+    selected_marker["selected_trade"] = True
+    if selected_marker.empty:
+        base["selected_trade"] = False
+        base["selected_layer"] = pd.NA
+        base["selected_tenor"] = pd.NA
+    else:
+        date_selection = selected_marker.rename(columns={"layer": "selected_layer", "tenor": "selected_tenor"}).drop(columns="selected_trade")
+        base = base.merge(date_selection, on="date", how="left", validate="many_to_one")
+        base["selected_trade"] = base["tenor"].eq(base["selected_tenor"])
+    base["lock_id"] = LOCK_ID
+    return base.sort_values(["date", "tenor"]).reset_index(drop=True), decisions.sort_values("date").reset_index(drop=True), candidate_panel
+
+
+def run_publish(config: PublishConfig) -> dict[str, Any]:
+    runtime, runtime_path = load_runtime_config(config.project_root, config.runtime_config_path)
+    lock = load_json(config.lock_config_path)
+    thresholds, sizes = expand_lock_tables(lock)
+    tiebreaks = load_static_tiebreaks(config.project_root, runtime)
+
+    features, intraday_feature_audit = load_feature_panel(
+        config.feature_panel, config.component_source, config.target_date
+    )
+    fit_log = load_fit_log(config.fit_log)
+    benchmark_keys = load_forecast_benchmark_keys(config.forecast_benchmark, config.target_date)
+    forecast, fit_audit = build_locked_forecast_history(
+        features, fit_log, benchmark_keys, config.target_date
+    )
+    forecast_reference_audit = validate_locked_forecast_reference(
+        forecast, config.locked_forecast_reference
+    )
+    implied = load_implied_variance(config.implied_variance, config.target_date)
+    eod = load_spy_eod(config.spy_eod, config.target_date)
+    rsi_history, rsi_audit = load_accepted_wilder_rsi(
+        config.rsi_history,
+        config.target_date,
+        list(runtime.get("accepted_rsi_versions", ["wilder_rsi14_spy_close_v2_long_warmup"])),
+    )
+    rv = load_rv21d(config.rv21d, config.target_date)
+
+    signal = compute_vrp_and_zscores(forecast, implied)
+    rsi_join = rsi_history[["date", "spy_close", "rsi14", "rsi_formula_version"]].copy()
+    signal = signal.merge(rsi_join, on="date", how="left", validate="many_to_one")
+    signal = signal.merge(rv, on="date", how="left", validate="many_to_one")
+    latest = signal.loc[signal["date"].eq(config.target_date)]
+    required_latest = [
+        "implied_variance", "forecast_variance_candidate", "model_vrp_log", "z_3m", "z_1y",
+        "rsi14", "rv21d_vol_pct",
+    ]
+    if len(latest) != 9 or latest[required_latest].isna().any().any():
+        raise RuntimeError(
+            f"Latest signal inputs are incomplete on {config.target_date.date()}: "
+            f"rows={len(latest)}, nulls={latest[required_latest].isna().sum().to_dict()}"
+        )
+
+    history, decisions, candidate_panel = apply_lock(signal, thresholds, sizes, tiebreaks, config.approved_nav)
+    latest_snapshot = history.loc[history["date"].eq(config.target_date)].copy()
+    if len(latest_snapshot) != 9:
+        raise RuntimeError("Latest snapshot must contain exactly nine tenor rows.")
+    if decisions.duplicated("date").any():
+        raise RuntimeError("Decision history is not unique by date.")
+    latest_decision = decisions.loc[decisions["date"].eq(config.target_date)].copy()
+    if len(latest_decision) != 1:
+        raise RuntimeError("Latest decision history must contain exactly one status row.")
+
+    stage = config.staging_dir
+    stage.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "forecast_history": stage / "vrp_hybrid_v2_forecast_history.parquet",
+        "signal_history": stage / "vrp_hybrid_v2_signal_history.parquet",
+        "latest_snapshot": stage / "vrp_hybrid_v2_latest_snapshot.parquet",
+        "selected_decisions": stage / "vrp_hybrid_v2_selected_decisions.parquet",
+        "execution_handoff": stage / "vrp_hybrid_v2_latest_execution_handoff.csv",
+        "candidate_panel": stage / "vrp_hybrid_v2_candidate_panel.parquet",
+        "fit_audit": stage / "vrp_hybrid_v2_forecast_fit_audit.csv",
+        "intraday_feature_audit": stage / "vrp_hybrid_v2_intraday_feature_audit.csv",
+        "thresholds": stage / "vrp_hybrid_v2_thresholds.csv",
+        "sizes": stage / "vrp_hybrid_v2_sizes.csv",
+        "tiebreaks": stage / "vrp_hybrid_v2_static_tiebreaks.csv",
+        "manifest": stage / "vrp_hybrid_v2_publish_manifest.json",
+    }
+    write_parquet_atomic(forecast, paths["forecast_history"])
+    write_parquet_atomic(history, paths["signal_history"])
+    write_parquet_atomic(latest_snapshot, paths["latest_snapshot"])
+    write_parquet_atomic(decisions, paths["selected_decisions"])
+    write_parquet_atomic(candidate_panel, paths["candidate_panel"])
+    write_csv_atomic(fit_audit, paths["fit_audit"])
+    write_csv_atomic(intraday_feature_audit, paths["intraday_feature_audit"])
+    write_csv_atomic(thresholds, paths["thresholds"])
+    write_csv_atomic(sizes, paths["sizes"])
+    write_csv_atomic(tiebreaks, paths["tiebreaks"])
+    handoff = latest_decision.loc[latest_decision["decision_status"].eq("TRADE")].copy()
+    write_csv_atomic(handoff, paths["execution_handoff"])
+
+    manifest = {
+        "release_id": LOCK_ID,
+        "generated_at": utc_now_iso(),
+        "target_date": str(config.target_date.date()),
+        "approved_nav": config.approved_nav,
+        "runtime_config": str(runtime_path),
+        "lock_config": str(config.lock_config_path),
+        "inputs": {
+            "feature_panel": str(config.feature_panel),
+            "component_source": str(config.component_source),
+            "forecast_benchmark": str(config.forecast_benchmark),
+            "locked_forecast_reference": str(config.locked_forecast_reference),
+            "implied_variance": str(config.implied_variance),
+            "spy_eod": str(config.spy_eod),
+            "rv21d": str(config.rv21d),
+            "accepted_rsi_history": str(config.rsi_history),
+            "fit_log": str(config.fit_log),
+        },
+        "row_counts": {
+            "forecast_history": len(forecast),
+            "signal_history": len(history),
+            "latest_snapshot": len(latest_snapshot),
+            "decision_history": len(decisions),
+            "candidate_panel": len(candidate_panel),
+        },
+        "latest_decision": latest_decision.to_dict(orient="records"),
+        "forecast_reference_audit": forecast_reference_audit,
+        "accepted_rsi_audit": rsi_audit,
+        "staged_outputs": {k: str(v) for k, v in paths.items()},
+        "published": bool(config.publish),
+    }
+    write_json(paths["manifest"], manifest)
+
+    if config.publish:
+        canonical_map = {
+            "forecast_history": resolve_path(config.project_root, runtime["canonical"]["forecast_history"]),
+            "signal_history": resolve_path(config.project_root, runtime["canonical"]["signal_history"]),
+            "latest_snapshot": resolve_path(config.project_root, runtime["canonical"]["latest_snapshot"]),
+            "selected_decisions": resolve_path(config.project_root, runtime["canonical"]["selected_decisions"]),
+            "execution_handoff": resolve_path(config.project_root, runtime["canonical"]["execution_handoff"]),
+        }
+        for key, destination in canonical_map.items():
+            assert destination is not None
+            atomic_copy(paths[key], destination)
+        manifest["canonical_outputs"] = {k: str(v) for k, v in canonical_map.items()}
+        write_json(paths["manifest"], manifest)
+    return manifest
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    project_root = args.project_root.resolve()
+    runtime_path = args.runtime_config.resolve() if args.runtime_config else project_root / "config/vrp_hybrid_v2_eod_runtime_config.json"
+    runtime, _ = load_runtime_config(project_root, runtime_path)
+    lock_path = args.lock_config.resolve() if args.lock_config else resolve_path(project_root, runtime["canonical"]["production_config"])
+    assert lock_path is not None
+    target = pd.Timestamp(pd.to_datetime(args.target_date, errors="raise")).normalize()
+    config = PublishConfig(
+        project_root=project_root,
+        runtime_config_path=runtime_path,
+        lock_config_path=lock_path,
+        target_date=target,
+        approved_nav=float(args.approved_nav),
+        feature_panel=_resolve_explicit_or_runtime(args.feature_panel, project_root, runtime, discovery_key="feature_panel"),
+        component_source=_resolve_explicit_or_runtime(
+            args.component_source, project_root, runtime, discovery_key="corsi_source"
+        ),
+        forecast_benchmark=_resolve_explicit_or_runtime(args.forecast_benchmark, project_root, runtime, canonical_key="forecast_benchmark"),
+        locked_forecast_reference=_resolve_explicit_or_runtime(
+            args.locked_forecast_reference, project_root, runtime, canonical_key="locked_intraday_forecast_reference"
+        ),
+        implied_variance=_resolve_explicit_or_runtime(args.implied_variance, project_root, runtime, canonical_key="implied_variance"),
+        spy_eod=_resolve_explicit_or_runtime(args.spy_eod, project_root, runtime, canonical_key="spy_eod"),
+        rv21d=_resolve_explicit_or_runtime(args.rv21d, project_root, runtime, canonical_key="rv21d"),
+        rsi_history=resolve_path(project_root, args.rsi_history or runtime["canonical"]["wilder_rsi"]),
+        fit_log=_resolve_explicit_or_runtime(args.fit_log, project_root, runtime, canonical_key="fit_log"),
+        staging_dir=args.staging_dir.resolve(),
+        publish=bool(args.publish),
+    )
+    assert config.rsi_history is not None
+    manifest = run_publish(config)
+    print("=" * 110)
+    print("Hybrid v2 EOD signal publish complete")
+    print("=" * 110)
+    print(json.dumps(manifest["latest_decision"], indent=2, default=str))
+    print(f"PUBLISHED: {manifest['published']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

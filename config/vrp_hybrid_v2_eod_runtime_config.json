@@ -1,0 +1,105 @@
+{
+  "release_id": "vrp_corsi_intraday_hybrid_v2",
+  "timezone": "America/New_York",
+  "close_buffer_minutes": 15,
+  "target_tenors": [
+    9,
+    12,
+    15,
+    18,
+    21,
+    24,
+    27,
+    30,
+    33
+  ],
+  "history_start": "2018-01-01",
+  "component_starts": {
+    "spy_eod": "2018-01-01",
+    "rv21d": "2018-01-01",
+    "wilder_rsi": "2018-01-02",
+    "implied_variance": "2018-06-25",
+    "corsi_source": "2018-06-25",
+    "feature_panel": "2018-06-25",
+    "forecast_history": "2020-01-02",
+    "signal_history": "2020-01-02",
+    "selected_decisions": "2020-01-02"
+  },
+  "thetadata": {
+    "host": "127.0.0.1",
+    "port": 25503,
+    "base_url": "http://127.0.0.1:25503/v3"
+  },
+  "scripts": {
+    "sofr": [
+      "notebooks/vrp_sofr_eod_update_v1.py"
+    ],
+    "implied_variance": [
+      "notebooks/vrp_implied_variance_eod_update_v1.py"
+    ],
+    "market_data": [
+      "notebooks/vrp_market_data_build_v1.py"
+    ],
+    "corsi_source": [
+      "notebooks/vrp_corsi_source_update_v1.py"
+    ],
+    "feature_panel": [
+      "notebooks/vrp_locked_cell4_feature_panel_update_v1.py"
+    ],
+    "wilder_rsi": [
+      "notebooks/vrp_hybrid_v2_wilder_rsi_update.py"
+    ]
+  },
+  "canonical": {
+    "production_config": "config/vrp_corsi_intraday_hybrid_v2_production_config.json",
+    "lock_manifest": "config/vrp_corsi_intraday_hybrid_v2_lock.json",
+    "spy_eod": "data/processed/market_data/spy_eod_prices_v1.parquet",
+    "rv21d": "data/processed/market_data/spy_realized_vol_history_v1.parquet",
+    "wilder_rsi": "data/processed/market_data/spy_wilder_rsi14_history_v1.parquet",
+    "implied_variance": "data/processed/vix_term_structure_history_v0_7_1_repaired_total_variance.parquet",
+    "fit_log": "data/audit/vrp_front_middle_corsi_forecast_repair_v1/07A_unified_fit_log_20260704_203242.csv",
+    "forecast_history": "data/processed/vrp_hybrid_v2_eod/vrp_hybrid_v2_forecast_history.parquet",
+    "signal_history": "data/processed/vrp_hybrid_v2_eod/vrp_hybrid_v2_signal_history.parquet",
+    "latest_snapshot": "data/processed/vrp_hybrid_v2_eod/vrp_hybrid_v2_latest_snapshot.parquet",
+    "selected_decisions": "data/processed/vrp_hybrid_v2_eod/vrp_hybrid_v2_selected_decisions.parquet",
+    "data_status": "data/processed/vrp_hybrid_v2_eod/vrp_hybrid_v2_data_status.json",
+    "execution_handoff": "data/processed/vrp_hybrid_v2_eod/vrp_hybrid_v2_latest_execution_handoff.csv",
+    "static_tiebreaks": "data/processed/vrp_hybrid_v2_eod/vrp_hybrid_v2_static_tiebreaks.csv",
+    "forecast_benchmark": "data/processed/vrp_front_middle_corsi_forecast_repair_v1/07A_unified_fds_no_min_return_oos_forecast_panel_20200102_20260709_20260710_101156_20260710_100854_schema_repair.parquet",
+    "locked_intraday_forecast_reference": "data/processed/corsi_model_challenge_v1/intraday_estimator_calibration_v1/corsi_intraday_estimator_calibration_forecast_panel_v1.parquet",
+    "implied_variance_update_surface": "data/processed/implied_variance/spx_vix_style_implied_variance_surface_v1.parquet",
+    "sofr_cache": "data/external/fred_sofr_history.csv"
+  },
+  "discovery": {
+    "sofr_cache": [
+      "data/external/fred_sofr_history.csv"
+    ],
+    "chain_cache_dirs": [
+      "data/raw/thetadata_chains",
+      "data/raw/thetadata/**/*chain*"
+    ],
+    "corsi_source": [
+      "data/processed/forecast_model_corsi_v1/corsi_model_feature_panel_v1_*.parquet",
+      "data/processed/forecast_model_corsi_v1/*model_ready*.parquet"
+    ],
+    "feature_panel": [
+      "data/processed/vrp_front_middle_corsi_forecast_repair_v1/04_front_middle_candidate_feature_panel_*.parquet"
+    ],
+    "selection_candidate_panel": [
+      "data/processed/corsi_model_challenge_v1/hybrid_trade_selection_comparison_v1/corsi_intraday_hybrid_trade_selection_comparison_candidate_panel_v1.parquet"
+    ],
+    "continuous_sizing": [
+      "data/audit/corsi_model_challenge_v1/hybrid_continuous_shrinkage_sizing_v1/*continuous_sizing_*.csv"
+    ],
+    "period_metrics": [
+      "data/audit/corsi_model_challenge_v1/hybrid_continuous_shrinkage_sizing_v1/*period_metrics_*.csv"
+    ]
+  },
+  "accepted_rsi_versions": [
+    "wilder_rsi14_spy_close_v2_long_warmup"
+  ],
+  "outputs": {
+    "processed_dir": "data/processed/vrp_hybrid_v2_eod",
+    "audit_dir": "data/audit/vrp_hybrid_v2_eod"
+  }
+}

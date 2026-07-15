@@ -1,0 +1,5 @@
+Start ThetaData
+java -jar C:\Users\patri\OneDrive\Desktop\ThetaTerminalv3.jar
+
+Start Juptyer
+py -m jupyter notebook

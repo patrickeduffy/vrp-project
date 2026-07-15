@@ -1,0 +1,22 @@
+# Canonical v1 paths, relative to project root.
+raw_chain_cache: data/raw/thetadata_chains
+
+external:
+  sofr_history_csv: data/external/fred_sofr_history.csv
+  spx_fred_csv: data/external/spx_index_daily_fred.csv
+  spx_fred_normalized_csv: data/external/spx_index_daily_fred_normalized.csv
+  cboe_vix_csv: data/external/cboe_vix_history.csv
+  cboe_vix9d_csv: data/external/cboe_vix9d_history.csv
+
+processed:
+  repaired_vix_term_structure_parquet: data/processed/vix_term_structure_history_v0_7_1_repaired_total_variance.parquet
+  repaired_vix_term_structure_csv: data/processed/vix_term_structure_history_v0_7_1_repaired_total_variance.csv
+  realized_variance_panel_parquet: data/processed/realized_variance_panel_v0_1.parquet
+  realized_variance_panel_csv: data/processed/realized_variance_panel_v0_1.csv
+  vrp_panel_parquet: data/processed/vrp_panel_v0_1.parquet
+  vrp_panel_csv: data/processed/vrp_panel_v0_1.csv
+  production_feature_panel_parquet: data/processed/production_feature_panel_v0_1.parquet
+  naked_atm_put_eod_panel_parquet: data/processed/naked_atm_put_eod_panel_v0_1.parquet
+
+audit:
+  production_v1_dir: data/audit/production_v1

@@ -1,0 +1,346 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+import pandas as pd
+import requests
+
+from vrp_hybrid_v2_common import (
+    DEFAULT_PROJECT_ROOT,
+    first_existing_column,
+    normalize_dates,
+    read_table,
+    utc_now_iso,
+    write_csv_atomic,
+    write_json,
+    write_parquet_atomic,
+)
+
+FORMULA_VERSION = "wilder_rsi14_spy_close_v2_long_warmup"
+DEFAULT_THETADATA_URL = "http://127.0.0.1:25503/v3/stock/history/eod"
+DEFAULT_WARMUP_START = "19930129"
+DEFAULT_OUTPUT_START = "20180102"
+DEFAULT_CHUNK_DAYS = 350
+DEFAULT_CACHE_REL = Path("data/raw/thetadata/spy_wilder_rsi_long_eod_v1.parquet")
+DEFAULT_CANONICAL_PRICE_REL = Path("data/processed/market_data/spy_eod_prices_v1.parquet")
+DEFAULT_OUTPUT_REL = Path("data/processed/market_data/spy_wilder_rsi14_history_v1.parquet")
+DEFAULT_AUDIT_REL = Path("data/audit/vrp_hybrid_v2_eod/rsi_updates")
+
+
+@dataclass(frozen=True)
+class Config:
+    project_root: Path
+    end_date: pd.Timestamp
+    warmup_start: pd.Timestamp
+    output_start: pd.Timestamp
+    thetadata_url: str
+    chunk_days: int
+    sleep_seconds: float
+    cache_path: Path
+    canonical_price_path: Path
+    output_path: Path
+    audit_dir: Path
+    force_full_refresh: bool
+
+
+def parse_date(value: str) -> pd.Timestamp:
+    parsed = pd.to_datetime(str(value), errors="raise")
+    return pd.Timestamp(parsed).normalize()
+
+
+def parse_args(argv: Sequence[str] | None = None) -> Config:
+    parser = argparse.ArgumentParser(
+        description="Update canonical SPY Wilder RSI14 with a long ThetaData EOD warmup."
+    )
+    parser.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT_ROOT)
+    parser.add_argument("--end-date", required=True, help="Target completed EOD date, YYYYMMDD or YYYY-MM-DD.")
+    parser.add_argument("--warmup-start", default=DEFAULT_WARMUP_START)
+    parser.add_argument("--output-start", default=DEFAULT_OUTPUT_START)
+    parser.add_argument("--thetadata-url", default=DEFAULT_THETADATA_URL)
+    parser.add_argument("--chunk-days", type=int, default=DEFAULT_CHUNK_DAYS)
+    parser.add_argument("--sleep-seconds", type=float, default=0.20)
+    parser.add_argument("--cache-path", type=Path, default=None)
+    parser.add_argument("--canonical-price-path", type=Path, default=None)
+    parser.add_argument("--output-path", type=Path, default=None)
+    parser.add_argument("--audit-dir", type=Path, default=None)
+    parser.add_argument("--force-full-refresh", action="store_true")
+    args = parser.parse_args(argv)
+
+    root = args.project_root.resolve()
+    def resolve(value: Path | None, default: Path) -> Path:
+        path = value if value is not None else default
+        return path if path.is_absolute() else root / path
+
+    return Config(
+        project_root=root,
+        end_date=parse_date(args.end_date),
+        warmup_start=parse_date(args.warmup_start),
+        output_start=parse_date(args.output_start),
+        thetadata_url=str(args.thetadata_url),
+        chunk_days=int(args.chunk_days),
+        sleep_seconds=float(args.sleep_seconds),
+        cache_path=resolve(args.cache_path, DEFAULT_CACHE_REL),
+        canonical_price_path=resolve(args.canonical_price_path, DEFAULT_CANONICAL_PRICE_REL),
+        output_path=resolve(args.output_path, DEFAULT_OUTPUT_REL),
+        audit_dir=resolve(args.audit_dir, DEFAULT_AUDIT_REL),
+        force_full_refresh=bool(args.force_full_refresh),
+    )
+
+
+def chunks(start: pd.Timestamp, end: pd.Timestamp, max_days: int) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    if max_days < 1:
+        raise ValueError("chunk_days must be positive")
+    result: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    cursor = pd.Timestamp(start)
+    while cursor <= end:
+        chunk_end = min(cursor + pd.Timedelta(days=max_days - 1), end)
+        result.append((cursor, chunk_end))
+        cursor = chunk_end + pd.Timedelta(days=1)
+    return result
+
+
+def payload_to_frame(payload: Any) -> pd.DataFrame:
+    if isinstance(payload, list):
+        return pd.DataFrame(payload)
+    if not isinstance(payload, dict):
+        raise TypeError(f"Unexpected ThetaData payload type: {type(payload).__name__}")
+
+    data = payload.get("response", payload.get("data", payload.get("results", [])))
+    if isinstance(data, dict):
+        data = data.get("response", data.get("data", data.get("results", [])))
+    if not isinstance(data, list):
+        raise TypeError("ThetaData payload did not contain a list response.")
+    if not data:
+        return pd.DataFrame()
+    if isinstance(data[0], dict):
+        return pd.DataFrame(data)
+
+    header = payload.get("header", {})
+    columns = None
+    if isinstance(header, dict):
+        columns = header.get("format") or header.get("columns")
+    if isinstance(columns, str):
+        columns = [x.strip() for x in columns.split(",")]
+    if columns and len(columns) == len(data[0]):
+        return pd.DataFrame(data, columns=columns)
+    return pd.DataFrame(data)
+
+
+def normalize_theta(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=["trade_date", "spy_close"])
+    date_col = first_existing_column(frame, ["date", "trade_date", "timestamp", "ms_of_day"], label="ThetaData date")
+    close_col = first_existing_column(frame, ["close", "price", "last"], label="ThetaData close")
+    out = frame[[date_col, close_col]].copy()
+    if pd.api.types.is_numeric_dtype(out[date_col]):
+        text = out[date_col].astype("Int64").astype("string")
+        parsed = pd.to_datetime(text, format="%Y%m%d", errors="coerce")
+        missing = parsed.isna()
+        if missing.any():
+            parsed.loc[missing] = pd.to_datetime(out.loc[missing, date_col], unit="ms", errors="coerce")
+    else:
+        parsed = pd.to_datetime(out[date_col], errors="coerce")
+    out["trade_date"] = pd.Series(parsed).dt.tz_localize(None).dt.normalize()
+    out["spy_close"] = pd.to_numeric(out[close_col], errors="coerce")
+    out = out.loc[out["trade_date"].notna() & out["spy_close"].gt(0)].copy()
+    return out[["trade_date", "spy_close"]].drop_duplicates("trade_date", keep="last").sort_values("trade_date")
+
+
+def fetch_theta(cfg: Config, start: pd.Timestamp, end: pd.Timestamp) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    frames: list[pd.DataFrame] = []
+    meta: list[dict[str, Any]] = []
+    work = chunks(start, end, cfg.chunk_days)
+    for idx, (chunk_start, chunk_end) in enumerate(work, start=1):
+        params = {
+            "symbol": "SPY",
+            "start_date": chunk_start.strftime("%Y%m%d"),
+            "end_date": chunk_end.strftime("%Y%m%d"),
+        }
+        print(f"RSI ThetaData chunk {idx}/{len(work)}: {params['start_date']} to {params['end_date']}", flush=True)
+        response = requests.get(cfg.thetadata_url, params=params, timeout=120)
+        status = int(response.status_code)
+        if status != 200:
+            raise RuntimeError(
+                f"ThetaData RSI request failed: status={status}, chunk={params}, body={response.text[:1000]}"
+            )
+        raw = payload_to_frame(response.json())
+        clean = normalize_theta(raw)
+        if not clean.empty:
+            frames.append(clean)
+        meta.append({
+            "chunk": idx,
+            "start_date": params["start_date"],
+            "end_date": params["end_date"],
+            "http_status": status,
+            "raw_rows": int(len(raw)),
+            "clean_rows": int(len(clean)),
+        })
+        if cfg.sleep_seconds > 0 and idx < len(work):
+            time.sleep(cfg.sleep_seconds)
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["trade_date", "spy_close"])
+    combined = combined.drop_duplicates("trade_date", keep="last").sort_values("trade_date").reset_index(drop=True)
+    return combined, meta
+
+
+def load_canonical_prices(path: Path, end_date: pd.Timestamp) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Canonical SPY EOD file missing: {path}")
+    frame = read_table(path)
+    date_col = first_existing_column(frame, ["trade_date", "date"], label="SPY EOD date")
+    close_col = first_existing_column(frame, ["spy_close", "close"], label="SPY EOD close")
+    out = frame[[date_col, close_col]].copy()
+    out["trade_date"] = normalize_dates(out[date_col])
+    out["spy_close"] = pd.to_numeric(out[close_col], errors="coerce")
+    out = out.loc[out["trade_date"].notna() & out["trade_date"].le(end_date)].copy()
+    if out["spy_close"].isna().any() or not out["spy_close"].gt(0).all():
+        raise RuntimeError("Canonical SPY EOD contains non-positive or missing closes.")
+    if out.duplicated("trade_date").any():
+        raise RuntimeError("Canonical SPY EOD is not unique by trade_date.")
+    if out.empty or out["trade_date"].max() != end_date:
+        raise RuntimeError(
+            f"Canonical SPY EOD does not reach target date: max={out['trade_date'].max()}, target={end_date.date()}"
+        )
+    return out[["trade_date", "spy_close"]].sort_values("trade_date").reset_index(drop=True)
+
+
+def compute_wilder(prices: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    out = prices.sort_values("trade_date").reset_index(drop=True).copy()
+    out["spy_change"] = out["spy_close"].diff()
+    gains = out["spy_change"].clip(lower=0).to_numpy(dtype=float)
+    losses = (-out["spy_change"].clip(upper=0)).to_numpy(dtype=float)
+    avg_gain = np.full(len(out), np.nan, dtype=float)
+    avg_loss = np.full(len(out), np.nan, dtype=float)
+    rsi = np.full(len(out), np.nan, dtype=float)
+    if len(out) > period:
+        avg_gain[period] = float(np.nanmean(gains[1: period + 1]))
+        avg_loss[period] = float(np.nanmean(losses[1: period + 1]))
+        for idx in range(period, len(out)):
+            if idx > period:
+                avg_gain[idx] = (avg_gain[idx - 1] * (period - 1) + gains[idx]) / period
+                avg_loss[idx] = (avg_loss[idx - 1] * (period - 1) + losses[idx]) / period
+            if math.isclose(avg_loss[idx], 0.0, abs_tol=1e-15):
+                rsi[idx] = 50.0 if math.isclose(avg_gain[idx], 0.0, abs_tol=1e-15) else 100.0
+            else:
+                rs = avg_gain[idx] / avg_loss[idx]
+                rsi[idx] = 100.0 - 100.0 / (1.0 + rs)
+    out["wilder_avg_gain_14"] = avg_gain
+    out["wilder_avg_loss_14"] = avg_loss
+    out["spy_wilder_rsi14"] = rsi
+    out["rsi_formula_version"] = FORMULA_VERSION
+    out["source_name"] = "ThetaData SPY EOD close; canonical project-window closes override long cache"
+    return out
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    cfg = parse_args(argv)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    cfg.audit_dir.mkdir(parents=True, exist_ok=True)
+    cfg.cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    canonical = load_canonical_prices(cfg.canonical_price_path, cfg.end_date)
+    existing = pd.DataFrame(columns=["trade_date", "spy_close"])
+    if cfg.cache_path.exists() and not cfg.force_full_refresh:
+        existing = read_table(cfg.cache_path)
+        date_col = first_existing_column(existing, ["trade_date", "date"])
+        close_col = first_existing_column(existing, ["spy_close", "close"])
+        existing = existing[[date_col, close_col]].rename(columns={date_col: "trade_date", close_col: "spy_close"})
+        existing["trade_date"] = normalize_dates(existing["trade_date"])
+        existing["spy_close"] = pd.to_numeric(existing["spy_close"], errors="coerce")
+        existing = existing.dropna().drop_duplicates("trade_date", keep="last").sort_values("trade_date")
+
+    if cfg.force_full_refresh or existing.empty:
+        pull_start = cfg.warmup_start
+    else:
+        pull_start = max(cfg.warmup_start, existing["trade_date"].max() + pd.Timedelta(days=1))
+
+    request_meta: list[dict[str, Any]] = []
+    fetched = pd.DataFrame(columns=["trade_date", "spy_close"])
+    if pull_start <= cfg.end_date:
+        fetched, request_meta = fetch_theta(cfg, pull_start, cfg.end_date)
+
+    long_prices = pd.concat([existing, fetched], ignore_index=True)
+    long_prices = long_prices.drop_duplicates("trade_date", keep="last")
+    # Canonical project-window prices are authoritative and always override the long-history cache.
+    long_prices = long_prices.loc[~long_prices["trade_date"].isin(canonical["trade_date"])].copy()
+    long_prices = pd.concat([long_prices, canonical], ignore_index=True)
+    long_prices = long_prices.loc[
+        long_prices["trade_date"].ge(cfg.warmup_start) & long_prices["trade_date"].le(cfg.end_date)
+    ].dropna().drop_duplicates("trade_date", keep="last").sort_values("trade_date").reset_index(drop=True)
+
+    if long_prices.empty or long_prices["trade_date"].min() >= cfg.output_start:
+        raise RuntimeError(
+            "Long RSI history does not contain a pre-output warmup window. "
+            f"min={long_prices['trade_date'].min() if len(long_prices) else None}, output_start={cfg.output_start.date()}"
+        )
+
+    write_parquet_atomic(long_prices, cfg.cache_path)
+    calculated = compute_wilder(long_prices)
+    output = canonical.loc[canonical["trade_date"].ge(cfg.output_start), ["trade_date"]].merge(
+        calculated,
+        on="trade_date",
+        how="left",
+        validate="one_to_one",
+    )
+    output = output[[
+        "trade_date", "spy_close", "spy_change", "wilder_avg_gain_14", "wilder_avg_loss_14",
+        "spy_wilder_rsi14", "rsi_formula_version", "source_name",
+    ]]
+
+    checks = [
+        {"check": "output_dates_match_canonical", "status": "PASS" if len(output) == int(canonical["trade_date"].ge(cfg.output_start).sum()) else "FAIL", "detail": f"rows={len(output)}"},
+        {"check": "latest_date_exact", "status": "PASS" if output["trade_date"].max() == cfg.end_date else "FAIL", "detail": f"max={output['trade_date'].max()} target={cfg.end_date}"},
+        {"check": "latest_rsi_finite", "status": "PASS" if np.isfinite(output.loc[output["trade_date"].eq(cfg.end_date), "spy_wilder_rsi14"]).all() else "FAIL", "detail": str(output.loc[output["trade_date"].eq(cfg.end_date), "spy_wilder_rsi14"].tolist())},
+        {"check": "rsi_bounds", "status": "PASS" if output["spy_wilder_rsi14"].dropna().between(0, 100).all() else "FAIL", "detail": "finite values must be in [0,100]"},
+        {"check": "formula_version_exact", "status": "PASS" if output["rsi_formula_version"].dropna().eq(FORMULA_VERSION).all() else "FAIL", "detail": FORMULA_VERSION},
+        {"check": "trade_dates_unique", "status": "PASS" if not output.duplicated("trade_date").any() else "FAIL", "detail": "one row per canonical date"},
+    ]
+    validation = pd.DataFrame(checks)
+    failures = validation.loc[validation["status"].ne("PASS")]
+
+    request_path = cfg.audit_dir / f"wilder_rsi_request_meta_{stamp}.csv"
+    validation_path = cfg.audit_dir / f"wilder_rsi_validation_{stamp}.csv"
+    manifest_path = cfg.audit_dir / f"wilder_rsi_manifest_{stamp}.json"
+    write_csv_atomic(pd.DataFrame(request_meta), request_path)
+    write_csv_atomic(validation, validation_path)
+
+    if len(failures):
+        raise RuntimeError(f"Wilder RSI update failed validation:\n{failures.to_string(index=False)}")
+
+    if cfg.output_path.exists():
+        backup = cfg.output_path.with_name(f"{cfg.output_path.stem}_backup_{stamp}{cfg.output_path.suffix}")
+        backup.write_bytes(cfg.output_path.read_bytes())
+    write_parquet_atomic(output, cfg.output_path)
+    manifest = {
+        "process": "vrp_hybrid_v2_wilder_rsi_update",
+        "generated_at": utc_now_iso(),
+        "target_date": str(cfg.end_date.date()),
+        "formula_version": FORMULA_VERSION,
+        "rows": int(len(output)),
+        "long_history_rows": int(len(long_prices)),
+        "long_history_start": str(long_prices["trade_date"].min().date()),
+        "long_history_end": str(long_prices["trade_date"].max().date()),
+        "latest_rsi": float(output.loc[output["trade_date"].eq(cfg.end_date), "spy_wilder_rsi14"].iloc[0]),
+        "output": str(cfg.output_path),
+        "cache": str(cfg.cache_path),
+        "validation": str(validation_path),
+        "request_meta": str(request_path),
+    }
+    write_json(manifest_path, manifest)
+
+    print(validation.to_string(index=False))
+    print(f"RSI output: {cfg.output_path}")
+    print(f"RSI manifest: {manifest_path}")
+    print("WILDER_RSI14_HYBRID_V2_UPDATE_PASS: True")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

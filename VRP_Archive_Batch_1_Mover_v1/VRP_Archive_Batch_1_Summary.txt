@@ -1,0 +1,41 @@
+VRP ARCHIVE BATCH 1 — REVIEW ONLY
+========================================================================
+Source root: C:\Users\patri\vrp_project
+Archive root: C:\Users\patri\VRP_Archive\batch_1_historical_research_20260712
+Files proposed: 2,099
+Total proposed size: 13.13 GB
+
+EXPLICITLY DEFERRED / KEPT ACTIVE
+------------------------------------------------------------------------
+Hybrid v2 production scripts/config/docs and canonical outputs
+Latest and historical Hybrid v2 EOD production audits
+data/raw/thetadata_chains (0.70 GB) — keep until cloud/object-storage plan
+data/processed/forecast_model_corsi_v1 — active component-source discovery
+data/processed/vrp_front_middle_corsi_forecast_repair_v1 — active feature/benchmark discovery
+data/processed/corsi_model_challenge_v1 and data/audit/corsi_model_challenge_v1
+data/audit/call_sleeve_research — active future call-sleeve work
+notebooks and notebooks v0 — includes current updater dependencies
+
+BATCH BREAKDOWN
+------------------------------------------------------------------------
+  10.49 GB    616 files  data/audit/vrp_unified_fds_core_signal_threshold_research_v1
+   0.86 GB     68 files  data/audit/signal_definition_sweep_v1
+   0.79 GB    127 files  data/processed/old
+   0.35 GB     76 files  data/audit/corsi_parameter_sweep_clean
+   0.21 GB    132 files  data/processed/vrp_unified_fds_core_signal_threshold_research_v1
+   0.08 GB    119 files  data/audit/vrp_core_bucket_parameters_v1
+   0.07 GB     56 files  Exact duplicates outside listed historical folders
+   0.07 GB    649 files  data/audit/forecast_model_corsi_v1
+   0.06 GB     15 files  data/processed/vrp_core_bucket_parameters_v1
+   0.05 GB    101 files  data/audit/forecast_update_inventory
+   0.04 GB     17 files  data/audit/vrp_final_signal
+   0.04 GB     99 files  data/audit/vrp_core_secondary_tertiary_independent_sizing_research_v1
+   0.03 GB     10 files  data/processed/backups
+   0.00 GB     14 files  data/archive
+
+SAFETY
+------------------------------------------------------------------------
+This is only a review manifest. No files have been moved.
+The eventual mover should copy, verify SHA-256, then remove the source.
+The mover should abort on any missing, changed, or protected source file.
+Because the archive is on C:, this cleans the active project but does not free disk capacity.

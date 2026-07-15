@@ -1,0 +1,23 @@
+tenors: [9, 12, 15, 18, 21, 24, 27, 30, 33]
+buckets:
+  front: [9, 12, 15]
+  middle: [18, 21, 24]
+  back: [27, 30, 33]
+
+core_thresholds:
+  front:  {vrp_log: 0.60, z_3m: 0.55, z_1y: 0.65, rsi_cap: 70, rv21d_floor: 8.5}
+  middle: {vrp_log: 0.65, z_3m: 0.75, z_1y: 0.65, rsi_cap: 68, rv21d_floor: 8.5}
+  back:   {vrp_log: 0.70, z_3m: 0.75, z_1y: 0.75, rsi_cap: 66, rv21d_floor: 8.5}
+
+secondary_thresholds:
+  front:  {vrp_log: 0.60, z_3m: 0.50, z_1y: 0.40, rsi_cap: 74, rv21d_floor: 6.5}
+  middle: {vrp_log: 0.60, z_3m: 0.50, z_1y: 0.50, rsi_cap: 70, rv21d_floor: 6.5}
+  back:   {vrp_log: 0.70, z_3m: 0.50, z_1y: 0.50, rsi_cap: 68, rv21d_floor: 6.5}
+
+risk_sizing:
+  core_back: 0.0500
+  core_middle: 0.0485
+  core_front: 0.0175
+  secondary_back: 0.0450
+  secondary_middle: 0.0325
+  secondary_front: 0.0175

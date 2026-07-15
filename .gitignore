@@ -1,0 +1,88 @@
+﻿# ============================================================
+# Credentials and private local configuration
+# ============================================================
+.env
+.env.*
+!.env.example
+credentials*.json
+secrets*.json
+secrets*.yaml
+secrets*.yml
+*.pem
+*.key
+
+# ============================================================
+# Python environments and caches
+# ============================================================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ============================================================
+# Jupyter temporary files
+# ============================================================
+.ipynb_checkpoints/
+
+# ============================================================
+# Market data, research outputs, and generated artifacts
+# ============================================================
+data/raw/
+data/interim/
+data/processed/
+data/audit/
+data/cache/
+outputs/
+artifacts/
+logs/
+
+# Large/generated data file formats
+*.parquet
+*.feather
+*.arrow
+*.duckdb
+*.sqlite
+*.sqlite3
+
+# ============================================================
+# Temporary files
+# ============================================================
+*.log
+*.tmp
+*.temp
+Thumbs.db
+.DS_Store
+
+# ============================================================
+# Local editor settings
+# ============================================================
+.vscode/
+.idea/
+
+# ============================================================
+# Data folders located anywhere inside the project
+# ============================================================
+**/data/raw/
+**/data/interim/
+**/data/processed/
+**/data/audit/
+**/data/cache/
+**/data/external/
+**/data/production/
+
+# Serialized datasets and generated model objects
+*.pkl
+*.pickle
+*.joblib
+
+# Compressed reproduction/output packages
+*.zip
+*.7z
+*.rar
+
+# Legacy workbook containing trade data
+old/Trades.xlsx

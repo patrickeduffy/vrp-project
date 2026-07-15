@@ -1,0 +1,5 @@
+pandas
+numpy
+pyarrow
+pandas_market_calendars
+requests

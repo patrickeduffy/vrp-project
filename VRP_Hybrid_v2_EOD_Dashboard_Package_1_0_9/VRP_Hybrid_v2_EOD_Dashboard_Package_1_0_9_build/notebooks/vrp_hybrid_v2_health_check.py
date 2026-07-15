@@ -1,0 +1,741 @@
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Sequence
+
+import numpy as np
+import pandas as pd
+
+from vrp_hybrid_v2_common import (
+    ACTIVE_TENORS,
+    DEFAULT_PROJECT_ROOT,
+    EXPECTED_TENORS,
+    LOCK_ID,
+    date_coverage,
+    first_existing_column,
+    glob_all,
+    glob_latest,
+    latest_completed_xnys_session,
+    load_json,
+    load_runtime_config,
+    normalize_dates,
+    normalize_tenor,
+    probe_tcp,
+    read_table,
+    resolve_path,
+    utc_now_iso,
+    write_csv_atomic,
+    write_json,
+    xnys_sessions,
+)
+
+
+@dataclass(frozen=True)
+class HealthConfig:
+    project_root: Path
+    runtime_config_path: Path
+    target_date: pd.Timestamp
+    csv_out: Path | None
+    json_out: Path | None
+    probe_thetadata: bool
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Validate Hybrid v2 EOD data coverage and production outputs.")
+    parser.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT_ROOT)
+    parser.add_argument("--runtime-config", type=Path, default=None)
+    parser.add_argument("--target-date", default=None, help="YYYY-MM-DD or YYYYMMDD. Default: latest completed XNYS session.")
+    parser.add_argument("--csv-out", type=Path, default=None)
+    parser.add_argument("--json-out", type=Path, default=None)
+    parser.add_argument("--no-thetadata-probe", action="store_true")
+    return parser.parse_args(argv)
+
+
+def parse_date(value: str | None, close_buffer: int) -> pd.Timestamp:
+    if not value:
+        return latest_completed_xnys_session(close_buffer_minutes=close_buffer)
+    return pd.Timestamp(pd.to_datetime(value, errors="raise")).normalize()
+
+
+def component_path(project_root: Path, runtime: dict[str, Any], key: str) -> Path:
+    value = runtime["canonical"][key]
+    path = resolve_path(project_root, value)
+    assert path is not None
+    return path
+
+
+def _inspect_table(
+    *,
+    name: str,
+    path: Path | None,
+    target_date: pd.Timestamp,
+    start_date: pd.Timestamp,
+    expected_tenors: list[int] | None = None,
+    require_target: bool = True,
+    required_columns: list[str] | None = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "component": name,
+        "path": str(path) if path else None,
+        "exists": bool(path and path.exists()),
+        "status": "MISSING",
+        "row_count": 0,
+        "earliest_date": None,
+        "latest_date": None,
+        "missing_date_count": None,
+        "interior_missing_count": None,
+        "recent_missing_count": None,
+        "missing_tenor_cells": None,
+        "duplicate_key_rows": None,
+        "detail": "",
+    }
+    if path is None or not path.exists():
+        row["detail"] = "File not found."
+        return row
+    try:
+        frame = read_table(path)
+    except Exception as exc:
+        row["status"] = "ERROR"
+        row["detail"] = f"Could not read file: {exc}"
+        return row
+    row["row_count"] = int(len(frame))
+    date_col = first_existing_column(frame, ("date", "trade_date", "observation_date"), required=False)
+    if date_col is None:
+        row["status"] = "ERROR"
+        row["detail"] = "No date-like column."
+        return row
+    frame = frame.copy()
+    frame["__date"] = normalize_dates(frame[date_col])
+    frame = frame.loc[frame["__date"].notna() & frame["__date"].le(target_date)].copy()
+    if frame.empty:
+        row["status"] = "ERROR"
+        row["detail"] = "No valid rows on or before target date."
+        return row
+    row["earliest_date"] = str(frame["__date"].min().date())
+    row["latest_date"] = str(frame["__date"].max().date())
+    expected = xnys_sessions(start_date, target_date)
+    coverage = date_coverage(frame["__date"].unique(), expected)
+    row["missing_date_count"] = coverage["missing_count"]
+    row["interior_missing_count"] = coverage["interior_missing_count"]
+    row["recent_missing_count"] = coverage["recent_missing_count"]
+    row["missing_dates"] = json.dumps(coverage["missing_dates"])
+    if required_columns:
+        missing_columns = [c for c in required_columns if c not in frame.columns]
+    else:
+        missing_columns = []
+    latest_null_columns: list[str] = []
+    if required_columns and not missing_columns:
+        latest_rows = frame.loc[frame["__date"].eq(target_date)]
+        latest_null_columns = [
+            column for column in required_columns
+            if latest_rows.empty or latest_rows[column].isna().any()
+        ]
+    key_cols = ["__date"]
+    if expected_tenors:
+        tenor_col = first_existing_column(frame, ("tenor", "target_dte", "dte", "target_days"), required=False)
+        if tenor_col is None:
+            row["status"] = "ERROR"
+            row["detail"] = "No tenor-like column."
+            return row
+        frame["__tenor"] = normalize_tenor(frame[tenor_col])
+        frame = frame.loc[frame["__tenor"].isin(expected_tenors)].copy()
+        key_cols.append("__tenor")
+        complete_dates = set(expected)
+        observed_pairs = set(zip(frame["__date"], frame["__tenor"].astype(int)))
+        missing_cells = [
+            (str(d.date()), t)
+            for d in expected
+            for t in expected_tenors
+            if (d, t) not in observed_pairs
+        ]
+        row["missing_tenor_cells"] = int(len(missing_cells))
+        row["missing_tenor_examples"] = json.dumps(missing_cells[:50])
+    duplicates = frame.duplicated(key_cols, keep=False)
+    row["duplicate_key_rows"] = int(duplicates.sum())
+    latest_ok = frame["__date"].max() == target_date if require_target else frame["__date"].max() <= target_date
+    hard_ok = (
+        latest_ok
+        and coverage["missing_count"] == 0
+        and row["duplicate_key_rows"] == 0
+        and (row["missing_tenor_cells"] in (None, 0))
+        and not missing_columns
+        and not latest_null_columns
+    )
+    row["status"] = "PASS" if hard_ok else "GAP"
+    details: list[str] = []
+    if not latest_ok:
+        details.append(f"latest={row['latest_date']} target={target_date.date()}")
+    if coverage["missing_count"]:
+        details.append(f"missing_dates={coverage['missing_count']}")
+    if row["missing_tenor_cells"]:
+        details.append(f"missing_tenor_cells={row['missing_tenor_cells']}")
+    if row["duplicate_key_rows"]:
+        details.append(f"duplicate_keys={row['duplicate_key_rows']}")
+    if missing_columns:
+        details.append(f"missing_columns={missing_columns}")
+    if latest_null_columns:
+        details.append(f"latest_null_columns={latest_null_columns}")
+    row["detail"] = "; ".join(details) if details else "Complete through target date."
+    return row
+
+
+def _inspect_sofr(project_root: Path, runtime: dict[str, Any], target_date: pd.Timestamp) -> dict[str, Any]:
+    path = glob_latest(project_root, runtime["discovery"].get("sofr_cache", []))
+    row = {
+        "component": "sofr_cache",
+        "path": str(path) if path else None,
+        "exists": bool(path),
+        "status": "MISSING",
+        "row_count": 0,
+        "earliest_date": None,
+        "latest_date": None,
+        "missing_date_count": None,
+        "interior_missing_count": None,
+        "recent_missing_count": None,
+        "missing_tenor_cells": None,
+        "duplicate_key_rows": None,
+        "detail": "No SOFR cache located. The implied-variance updater may create it.",
+    }
+    if path is None:
+        return row
+    try:
+        frame = read_table(path)
+        date_col = first_existing_column(frame, ("date", "observation_date", "DATE"), required=False)
+        if date_col is None:
+            raise KeyError("No date column")
+        dates = normalize_dates(frame[date_col]).dropna()
+        row["row_count"] = int(len(frame))
+        row["earliest_date"] = str(dates.min().date()) if len(dates) else None
+        row["latest_date"] = str(dates.max().date()) if len(dates) else None
+        age = int((target_date - dates.max()).days) if len(dates) else 9999
+        row["status"] = "PASS" if age <= 10 else "STALE"
+        row["detail"] = f"Latest SOFR observation is {age} calendar days before target; carry-forward is allowed."
+    except Exception as exc:
+        row["status"] = "ERROR"
+        row["detail"] = f"Could not inspect SOFR cache: {exc}"
+    return row
+
+
+def _inspect_chain_cache(project_root: Path, runtime: dict[str, Any]) -> dict[str, Any]:
+    directories: list[Path] = []
+    for pattern in runtime["discovery"].get("chain_cache_dirs", []):
+        candidate = resolve_path(project_root, pattern)
+        if candidate and candidate.is_dir():
+            directories.append(candidate)
+        else:
+            directories.extend([p for p in project_root.glob(pattern) if p.is_dir()])
+    files: list[Path] = []
+    for directory in directories:
+        files.extend([p for p in directory.rglob("*") if p.is_file()])
+    latest = max(files, key=lambda p: p.stat().st_mtime) if files else None
+    return {
+        "component": "spx_spxw_chain_cache",
+        "path": "; ".join(str(p) for p in directories) if directories else None,
+        "exists": bool(directories),
+        "status": "PASS" if files else "MISSING",
+        "row_count": int(len(files)),
+        "earliest_date": None,
+        "latest_date": None,
+        "missing_date_count": None,
+        "interior_missing_count": None,
+        "recent_missing_count": None,
+        "missing_tenor_cells": None,
+        "duplicate_key_rows": None,
+        "detail": f"Cached files={len(files)}; latest_modified={pd.Timestamp(latest.stat().st_mtime, unit='s') if latest else None}",
+    }
+
+
+def _base_static_row(component: str, path: Path) -> dict[str, Any]:
+    return {
+        "component": component,
+        "path": str(path),
+        "exists": path.exists(),
+        "status": "MISSING",
+        "row_count": 0,
+        "earliest_date": None,
+        "latest_date": None,
+        "missing_date_count": None,
+        "interior_missing_count": None,
+        "recent_missing_count": None,
+        "missing_tenor_cells": None,
+        "duplicate_key_rows": None,
+        "detail": "File not found.",
+    }
+
+
+def _inspect_fit_log(path: Path, target_year: int) -> dict[str, Any]:
+    row = _base_static_row("locked_fit_log", path)
+    if not path.exists():
+        return row
+    try:
+        frame = pd.read_csv(path)
+        required = {"model_spec", "tenor", "test_year", "selected_alpha", "train_rows_used"}
+        missing = sorted(required - set(frame.columns))
+        if missing:
+            raise RuntimeError(f"missing_columns={missing}")
+        subset = frame.loc[
+            frame["model_spec"].astype(str).eq("unified_fds_no_min_return")
+        ].copy()
+        subset["tenor"] = pd.to_numeric(subset["tenor"], errors="coerce")
+        subset["test_year"] = pd.to_numeric(subset["test_year"], errors="coerce")
+        subset["selected_alpha"] = pd.to_numeric(subset["selected_alpha"], errors="coerce")
+        subset["train_rows_used"] = pd.to_numeric(subset["train_rows_used"], errors="coerce")
+
+        duplicates = subset.duplicated(["tenor", "test_year"], keep=False).sum()
+        identity_ok = (
+            subset["tenor"].notna().all()
+            and subset["test_year"].notna().all()
+            and subset["train_rows_used"].notna().all()
+        )
+        nonnegative_rows_ok = subset["train_rows_used"].ge(0).all()
+        alpha_values_ok = (subset["selected_alpha"].isna() | subset["selected_alpha"].ge(0)).all()
+
+        active = subset.loc[subset["train_rows_used"].gt(0)].copy()
+        placeholders = subset.loc[subset["train_rows_used"].eq(0)].copy()
+        placeholder_contracts_ok = True
+        invalid_placeholder_rows: list[dict[str, int]] = []
+        if identity_ok and nonnegative_rows_ok:
+            for placeholder_row in placeholders.itertuples(index=False):
+                tenor_active = active.loc[active["tenor"].eq(placeholder_row.tenor)]
+                if tenor_active.empty:
+                    placeholder_contracts_ok = False
+                    invalid_placeholder_rows.append({
+                        "tenor": int(placeholder_row.tenor),
+                        "test_year": int(placeholder_row.test_year),
+                        "reason": "no active positive-row contract",
+                    })
+                    continue
+                first_active_year = int(tenor_active["test_year"].min())
+                if int(placeholder_row.test_year) >= first_active_year:
+                    placeholder_contracts_ok = False
+                    invalid_placeholder_rows.append({
+                        "tenor": int(placeholder_row.tenor),
+                        "test_year": int(placeholder_row.test_year),
+                        "first_active_year": first_active_year,
+                    })
+
+        current = active.loc[active["test_year"].eq(target_year)].copy()
+        tenors = sorted(current["tenor"].dropna().astype(int).unique())
+        train_rows_ok = current["train_rows_used"].notna().all() and current["train_rows_used"].gt(0).all()
+        missing_alpha_tenors = sorted(
+            current.loc[current["selected_alpha"].isna(), "tenor"].dropna().astype(int).unique()
+        )
+        ok = (
+            tenors == EXPECTED_TENORS
+            and duplicates == 0
+            and identity_ok
+            and nonnegative_rows_ok
+            and alpha_values_ok
+            and placeholder_contracts_ok
+            and train_rows_ok
+        )
+        row.update({
+            "row_count": int(len(subset)),
+            "duplicate_key_rows": int(duplicates),
+            "status": "PASS" if ok else "ERROR",
+            "detail": (
+                f"target_year={target_year}; tenors={tenors}; train_rows_ok={train_rows_ok}; "
+                f"alpha_values_ok={alpha_values_ok}; missing_alpha_tenors={missing_alpha_tenors}; "
+                f"ignored_pre_model_placeholder_rows={len(placeholders)}; "
+                f"placeholder_contracts_ok={placeholder_contracts_ok}; "
+                f"invalid_placeholder_rows={invalid_placeholder_rows[:10]}; "
+                "blank alpha policy=locked yearly walk-forward reselection in publisher"
+            ),
+        })
+    except Exception as exc:
+        row["status"] = "ERROR"
+        row["detail"] = str(exc)
+    return row
+
+
+def _inspect_forecast_benchmark(path: Path) -> dict[str, Any]:
+    """Inspect the benchmark as a historical date-grid anchor, not as a unique forecast panel.
+
+    The canonical benchmark file intentionally contains multiple model/spec rows for many
+    date x tenor keys. The locked publisher consumes only the distinct historical key grid,
+    so raw duplicate rows are informational rather than a hard failure here.
+    """
+    row = _base_static_row("locked_forecast_benchmark", path)
+    if not path.exists():
+        return row
+    try:
+        frame = read_table(path)
+        date_col = first_existing_column(frame, ("date", "trade_date"), label="benchmark date")
+        tenor_col = first_existing_column(frame, ("tenor", "target_dte", "dte"), label="benchmark tenor")
+        dates = normalize_dates(frame[date_col])
+        tenors = normalize_tenor(frame[tenor_col])
+        raw_keys = pd.DataFrame({"date": dates, "tenor": tenors}).dropna()
+        raw_keys = raw_keys.loc[raw_keys["tenor"].isin(EXPECTED_TENORS)].copy()
+        raw_duplicate_rows = int(raw_keys.duplicated(["date", "tenor"], keep=False).sum())
+        keys = raw_keys.drop_duplicates(["date", "tenor"]).copy()
+        observed_tenors = sorted(keys["tenor"].astype(int).unique())
+        ok = bool(len(keys)) and observed_tenors == EXPECTED_TENORS
+        row.update({
+            "row_count": int(len(raw_keys)),
+            "earliest_date": str(keys["date"].min().date()) if len(keys) else None,
+            "latest_date": str(keys["date"].max().date()) if len(keys) else None,
+            "duplicate_key_rows": 0,
+            "status": "PASS" if ok else "ERROR",
+            "detail": (
+                f"tenors={observed_tenors}; historical test-date anchor uses distinct date x tenor keys; "
+                f"raw_rows={len(raw_keys)}; unique_keys={len(keys)}; "
+                f"raw_multi_spec_duplicate_rows={raw_duplicate_rows}"
+            ),
+        })
+    except Exception as exc:
+        row["status"] = "ERROR"
+        row["detail"] = str(exc)
+    return row
+
+
+def _inspect_spy_eod(path: Path, target_date: pd.Timestamp, start_date: pd.Timestamp) -> dict[str, Any]:
+    """Validate SPY EOD coverage plus the accepted close-column aliases."""
+    row = _inspect_table(
+        name="spy_eod",
+        path=path,
+        target_date=target_date,
+        start_date=start_date,
+        expected_tenors=None,
+        require_target=True,
+        required_columns=None,
+    )
+    if not path.exists():
+        return row
+    try:
+        frame = read_table(path)
+        date_col = first_existing_column(
+            frame, ("date", "trade_date", "observation_date"), required=False
+        )
+        close_col = first_existing_column(
+            frame,
+            ("close", "eod_close", "spy_close", "adj_close", "adjusted_close"),
+            required=False,
+        )
+        target_close_ok = False
+        target_close_value = None
+        if date_col is not None and close_col is not None:
+            dates = normalize_dates(frame[date_col])
+            closes = pd.to_numeric(frame[close_col], errors="coerce")
+            target_values = closes.loc[dates.eq(target_date)].replace([np.inf, -np.inf], np.nan).dropna()
+            target_close_ok = bool(len(target_values)) and bool(target_values.gt(0).all())
+            if len(target_values):
+                target_close_value = float(target_values.iloc[-1])
+        if date_col is None or close_col is None or not target_close_ok:
+            row["status"] = "ERROR"
+            row["detail"] = (
+                f"SPY EOD close semantic contract failed: date_column={date_col}, "
+                f"close_column={close_col}, target_close_ok={target_close_ok}, "
+                f"target_close={target_close_value}"
+            )
+        else:
+            base_detail = row.get("detail") or "Complete through target date."
+            row["detail"] = (
+                f"{base_detail}; close_column={close_col}; "
+                f"target_close={target_close_value:.6f}"
+            )
+    except Exception as exc:
+        row["status"] = "ERROR"
+        row["detail"] = f"Could not validate SPY EOD close semantic contract: {exc}"
+    return row
+
+
+def _inspect_locked_intraday_reference(path: Path) -> dict[str, Any]:
+    row = _base_static_row("locked_intraday_forecast_reference", path)
+    if not path.exists():
+        return row
+    try:
+        frame = read_table(path)
+        model_col = first_existing_column(frame, ("model_name", "forecast_model"), required=False)
+        if model_col is not None:
+            frame = frame.loc[frame[model_col].astype(str).eq("intraday_ridge_locked")].copy()
+        date_col = first_existing_column(frame, ("date", "trade_date"), label="reference date")
+        tenor_col = first_existing_column(frame, ("tenor", "target_dte", "dte"), label="reference tenor")
+        required_value_sets = [
+            ("predicted_log_variance_candidate", "predicted_log_variance", "forecast_log_variance"),
+            ("forecast_variance_candidate", "forecast_variance"),
+            ("candidate_forecast_vol_pct", "forecast_vol_pct", "forecast_volatility_pct"),
+        ]
+        value_cols = [first_existing_column(frame, aliases, label="reference forecast field") for aliases in required_value_sets]
+        keys = pd.DataFrame({
+            "date": normalize_dates(frame[date_col]),
+            "tenor": normalize_tenor(frame[tenor_col]),
+        })
+        keys = keys.loc[keys["date"].notna() & keys["tenor"].isin(EXPECTED_TENORS)].copy()
+        duplicates = keys.duplicated(["date", "tenor"], keep=False).sum()
+        observed_tenors = sorted(keys["tenor"].dropna().astype(int).unique())
+        values_ok = frame[value_cols].apply(pd.to_numeric, errors="coerce").notna().all().all()
+        ok = bool(len(keys)) and duplicates == 0 and observed_tenors == EXPECTED_TENORS and values_ok
+        row.update({
+            "row_count": int(len(keys)),
+            "earliest_date": str(keys["date"].min().date()) if len(keys) else None,
+            "latest_date": str(keys["date"].max().date()) if len(keys) else None,
+            "duplicate_key_rows": int(duplicates),
+            "status": "PASS" if ok else "ERROR",
+            "detail": f"intraday_ridge_locked; tenors={observed_tenors}; values_ok={values_ok}",
+        })
+    except Exception as exc:
+        row["status"] = "ERROR"
+        row["detail"] = str(exc)
+    return row
+
+
+def _inspect_static_tiebreaks(path: Path) -> dict[str, Any]:
+    row = {
+        "component": "static_tiebreaks",
+        "path": str(path),
+        "exists": path.exists(),
+        "status": "MISSING",
+        "row_count": 0,
+        "earliest_date": None,
+        "latest_date": None,
+        "missing_date_count": None,
+        "interior_missing_count": None,
+        "recent_missing_count": None,
+        "missing_tenor_cells": None,
+        "duplicate_key_rows": None,
+        "detail": "Canonical locked tie-break snapshot has not yet been materialized.",
+    }
+    if not path.exists():
+        return row
+    try:
+        frame = pd.read_csv(path)
+        required = [
+            "layer", "bucket", "tenor", "continuous_quality_score",
+            "research_sleeve_win_rate_pct", "research_sleeve_worst_1pct_mean_return",
+        ]
+        missing = sorted(set(required) - set(frame.columns))
+        duplicates = frame.duplicated(["layer", "bucket", "tenor"], keep=False).sum() if not missing else None
+        numeric_nulls = frame[[c for c in required[3:] if c in frame]].apply(pd.to_numeric, errors="coerce").isna().sum().sum()
+        ok = len(frame) == 13 and not missing and duplicates == 0 and numeric_nulls == 0
+        row.update({
+            "row_count": int(len(frame)),
+            "duplicate_key_rows": int(duplicates) if duplicates is not None else None,
+            "status": "PASS" if ok else "ERROR",
+            "detail": (
+                "13 unique locked sleeve tie-break rows."
+                if ok else
+                f"rows={len(frame)}, missing_columns={missing}, duplicate_rows={duplicates}, numeric_nulls={numeric_nulls}"
+            ),
+        })
+    except Exception as exc:
+        row["status"] = "ERROR"
+        row["detail"] = str(exc)
+    return row
+
+
+def run_health_check(config: HealthConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
+    runtime, runtime_path = load_runtime_config(config.project_root, config.runtime_config_path)
+    close_buffer = int(runtime.get("close_buffer_minutes", 15))
+    target_date = config.target_date
+    component_starts = runtime.get("component_starts", {})
+    rows: list[dict[str, Any]] = []
+
+    lock_path = component_path(config.project_root, runtime, "production_config")
+    lock_status = {
+        "component": "hybrid_v2_production_config",
+        "path": str(lock_path),
+        "exists": lock_path.exists(),
+        "status": "MISSING",
+        "row_count": None,
+        "earliest_date": None,
+        "latest_date": None,
+        "missing_date_count": None,
+        "interior_missing_count": None,
+        "recent_missing_count": None,
+        "missing_tenor_cells": None,
+        "duplicate_key_rows": None,
+        "detail": "",
+    }
+    if lock_path.exists():
+        try:
+            lock = load_json(lock_path)
+            release = lock.get("release_id") or lock.get("lock_id")
+            lock_status["status"] = "PASS" if release == LOCK_ID else "ERROR"
+            lock_status["detail"] = f"release_id={release}"
+        except Exception as exc:
+            lock_status["status"] = "ERROR"
+            lock_status["detail"] = str(exc)
+    else:
+        lock_status["detail"] = "Production configuration is required."
+    rows.append(lock_status)
+
+    if config.probe_thetadata:
+        td = runtime.get("thetadata", {})
+        ok, detail = probe_tcp(str(td.get("host", "127.0.0.1")), int(td.get("port", 25503)))
+        rows.append({
+            "component": "thetadata_terminal",
+            "path": f"{td.get('host', '127.0.0.1')}:{td.get('port', 25503)}",
+            "exists": ok,
+            "status": "PASS" if ok else "ERROR",
+            "row_count": None,
+            "earliest_date": None,
+            "latest_date": None,
+            "missing_date_count": None,
+            "interior_missing_count": None,
+            "recent_missing_count": None,
+            "missing_tenor_cells": None,
+            "duplicate_key_rows": None,
+            "detail": detail,
+        })
+
+    rows.append(_inspect_sofr(config.project_root, runtime, target_date))
+    rows.append(_inspect_chain_cache(config.project_root, runtime))
+    fit_log_path = component_path(config.project_root, runtime, "fit_log")
+    benchmark_path = component_path(config.project_root, runtime, "forecast_benchmark")
+    intraday_reference_path = component_path(config.project_root, runtime, "locked_intraday_forecast_reference")
+    rows.append(_inspect_fit_log(fit_log_path, int(target_date.year)))
+    rows.append(_inspect_forecast_benchmark(benchmark_path))
+    rows.append(_inspect_locked_intraday_reference(intraday_reference_path))
+    static_tiebreak_path = component_path(config.project_root, runtime, "static_tiebreaks")
+    rows.append(_inspect_static_tiebreaks(static_tiebreak_path))
+
+    spy_start = pd.Timestamp(component_starts.get("spy_eod", runtime.get("history_start", "2018-01-01")))
+    rows.append(_inspect_spy_eod(
+        component_path(config.project_root, runtime, "spy_eod"),
+        target_date,
+        spy_start,
+    ))
+
+    table_specs = [
+        ("rv21d", component_path(config.project_root, runtime, "rv21d"), None, None),
+        ("wilder_rsi", component_path(config.project_root, runtime, "wilder_rsi"), None, None),
+        ("implied_variance", component_path(config.project_root, runtime, "implied_variance"), EXPECTED_TENORS, None),
+        ("forecast_history", component_path(config.project_root, runtime, "forecast_history"), EXPECTED_TENORS, ["forecast_variance_candidate"]),
+        ("signal_history", component_path(config.project_root, runtime, "signal_history"), EXPECTED_TENORS, ["model_vrp_log", "z_3m", "z_1y"]),
+        ("latest_snapshot", component_path(config.project_root, runtime, "latest_snapshot"), EXPECTED_TENORS, [
+            "implied_variance", "implied_vol_pct", "forecast_variance_candidate", "forecast_vol_pct",
+            "model_vrp_log", "z_3m", "z_1y", "rsi14", "rv21d_vol_pct",
+            "core_pass", "secondary_pass", "selected_trade",
+        ]),
+        ("selected_decisions", component_path(config.project_root, runtime, "selected_decisions"), None, ["decision_status"]),
+    ]
+    for name, path, tenors, required in table_specs:
+        start = pd.Timestamp(component_starts.get(name, runtime.get("history_start", "2018-01-01")))
+        if name == "latest_snapshot":
+            start = target_date
+        rows.append(_inspect_table(
+            name=name,
+            path=path,
+            target_date=target_date,
+            start_date=start,
+            expected_tenors=tenors,
+            require_target=True,
+            required_columns=required,
+        ))
+
+    # The accepted RSI file is not merely a date series; its long-warmup formula version is part of the lock.
+    rsi_path = component_path(config.project_root, runtime, "wilder_rsi")
+    if rsi_path is not None and rsi_path.exists():
+        try:
+            rsi_frame = read_table(rsi_path)
+            version_col = first_existing_column(
+                rsi_frame, ("rsi_formula_version", "rsi_version"), required=False
+            )
+            rsi_col = first_existing_column(
+                rsi_frame, ("spy_wilder_rsi14", "rsi14"), required=False
+            )
+            accepted = set(runtime.get("accepted_rsi_versions", []))
+            observed = set(rsi_frame[version_col].dropna().astype(str).unique()) if version_col else set()
+            version_ok = bool(version_col) and bool(observed) and observed.issubset(accepted)
+            value_ok = bool(rsi_col) and pd.to_numeric(rsi_frame[rsi_col], errors="coerce").dropna().between(0, 100).all()
+            for idx, row in enumerate(rows):
+                if row.get("component") == "wilder_rsi":
+                    if not version_ok or not value_ok:
+                        rows[idx]["status"] = "ERROR"
+                        rows[idx]["detail"] = (
+                            f"RSI semantic contract failed: observed_versions={sorted(observed)}, "
+                            f"accepted_versions={sorted(accepted)}, values_in_bounds={value_ok}"
+                        )
+                    else:
+                        rows[idx]["detail"] = (
+                            f"Complete through target date; formula_version={sorted(observed)}"
+                        )
+                    break
+        except Exception as exc:
+            for idx, row in enumerate(rows):
+                if row.get("component") == "wilder_rsi":
+                    rows[idx]["status"] = "ERROR"
+                    rows[idx]["detail"] = f"Could not validate RSI semantic contract: {exc}"
+                    break
+
+    for discovery_name in ("corsi_source", "feature_panel"):
+        path = glob_latest(config.project_root, runtime["discovery"].get(discovery_name, []))
+        start = pd.Timestamp(component_starts.get(discovery_name, "2018-06-25"))
+        rows.append(_inspect_table(
+            name=discovery_name,
+            path=path,
+            target_date=target_date,
+            start_date=start,
+            expected_tenors=EXPECTED_TENORS,
+            require_target=True,
+        ))
+
+    frame = pd.DataFrame(rows)
+    hard_components = {
+        "hybrid_v2_production_config",
+        "thetadata_terminal",
+        "sofr_cache",
+        "spx_spxw_chain_cache",
+        "static_tiebreaks",
+        "locked_fit_log",
+        "locked_forecast_benchmark",
+        "locked_intraday_forecast_reference",
+        "spy_eod",
+        "rv21d",
+        "wilder_rsi",
+        "implied_variance",
+        "corsi_source",
+        "feature_panel",
+        "forecast_history",
+        "signal_history",
+        "latest_snapshot",
+        "selected_decisions",
+    }
+    hard_failures = frame.loc[frame["component"].isin(hard_components) & ~frame["status"].eq("PASS")]
+    payload = {
+        "release_id": LOCK_ID,
+        "generated_at": utc_now_iso(),
+        "project_root": str(config.project_root),
+        "runtime_config": str(runtime_path),
+        "target_date": str(target_date.date()),
+        "overall_status": "PASS" if hard_failures.empty else "FAIL",
+        "hard_failure_count": int(len(hard_failures)),
+        "components": frame.to_dict(orient="records"),
+    }
+    if config.csv_out:
+        write_csv_atomic(frame, config.csv_out)
+    if config.json_out:
+        write_json(config.json_out, payload)
+    return frame, payload
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    project_root = args.project_root.resolve()
+    runtime_path = args.runtime_config.resolve() if args.runtime_config else project_root / "config/vrp_hybrid_v2_eod_runtime_config.json"
+    runtime, _ = load_runtime_config(project_root, runtime_path)
+    target_date = parse_date(args.target_date, int(runtime.get("close_buffer_minutes", 15)))
+    csv_out = args.csv_out.resolve() if args.csv_out else None
+    json_out = args.json_out.resolve() if args.json_out else None
+    config = HealthConfig(
+        project_root=project_root,
+        runtime_config_path=runtime_path,
+        target_date=target_date,
+        csv_out=csv_out,
+        json_out=json_out,
+        probe_thetadata=not args.no_thetadata_probe,
+    )
+    frame, payload = run_health_check(config)
+    print("=" * 110)
+    print("Hybrid v2 EOD data health")
+    print("=" * 110)
+    print(frame[["component", "status", "latest_date", "missing_date_count", "missing_tenor_cells", "detail"]].to_string(index=False))
+    print(f"OVERALL_STATUS: {payload['overall_status']}")
+    return 0 if payload["overall_status"] == "PASS" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
