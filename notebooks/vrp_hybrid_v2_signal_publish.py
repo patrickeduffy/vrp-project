@@ -37,9 +37,6 @@ from vrp_hybrid_v2_common import (
 EPS = 1e-12
 MODEL_SPEC = "unified_fds_no_min_return"
 ALPHA_GRID = [1.0, 10.0, 100.0, 300.0, 1000.0]
-FALLBACK_ALPHA = 100.0
-MIN_INNER_TRAIN_ROWS = 250
-MIN_INNER_VAL_ROWS = 30
 TARGET_LOG_COL = "target_log_variance"
 LEAKAGE_DATE_COL = "last_forward_rv_date"
 BENCHMARK_CONTRACT_FEATURES = [
@@ -90,6 +87,7 @@ class PublishConfig:
     fit_log: Path
     staging_dir: Path
     publish: bool
+    allow_reference_difference: bool
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -110,6 +108,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--fit-log", type=Path, default=None)
     parser.add_argument("--staging-dir", type=Path, required=True)
     parser.add_argument("--publish", action="store_true")
+    parser.add_argument(
+        "--allow-reference-difference",
+        action="store_true",
+        help=(
+            "Permit a staging-only rebuilt forecast to differ from the frozen pre-repair reference. "
+            "Publication is prohibited while this flag is active."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -314,85 +320,73 @@ def load_feature_panel(
 
 
 def load_fit_log(path: Path) -> pd.DataFrame:
+    """Load only formally fitted tenor-year contracts.
+
+    Rows marked skipped_insufficient_train_rows are historical bookkeeping, not
+    permission to score that year. A production forecast requires candidate_fit,
+    a finite selected alpha, positive train rows, and positive test rows.
+    """
     frame = pd.read_csv(path)
-    required = ["model_spec", "tenor", "test_year", "selected_alpha", "train_rows_used"]
+    required = [
+        "model_spec", "tenor", "test_year", "fit_status", "selected_alpha",
+        "train_rows_used", "test_rows_scored",
+    ]
     missing = [c for c in required if c not in frame.columns]
     if missing:
         raise RuntimeError(f"Fit log missing columns: {missing}")
 
     frame = frame.loc[frame["model_spec"].astype(str).eq(MODEL_SPEC)].copy()
-    for column in ["tenor", "test_year", "selected_alpha", "train_rows_used"]:
+    for column in ["tenor", "test_year", "selected_alpha", "train_rows_used", "test_rows_scored"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["fit_status"] = frame["fit_status"].astype(str).str.strip()
     frame = frame.loc[frame["tenor"].isin(EXPECTED_TENORS)].copy()
-
     if frame.duplicated(["tenor", "test_year"]).any():
-        raise RuntimeError("Fit log is not unique by tenor × test year.")
+        raise RuntimeError("Fit log is not unique by tenor x test year.")
 
-    invalid_identity = frame.loc[
-        frame["tenor"].isna()
-        | frame["test_year"].isna()
-        | frame["train_rows_used"].isna()
+    identity_bad = frame.loc[
+        frame[["tenor", "test_year", "train_rows_used", "test_rows_scored"]].isna().any(axis=1)
     ]
-    if not invalid_identity.empty:
+    if not identity_bad.empty:
         raise RuntimeError(
-            "Fit log contains missing tenor/test-year/train-row identifiers: "
-            f"{invalid_identity[['tenor', 'test_year', 'train_rows_used']].head(20).to_dict(orient='records')}"
+            "Fit log contains missing contract identifiers: "
+            f"{identity_bad[required].head(20).to_dict(orient='records')}"
+        )
+    allowed = {"candidate_fit", "skipped_insufficient_train_rows"}
+    unexpected = sorted(set(frame["fit_status"]) - allowed)
+    if unexpected:
+        raise RuntimeError(f"Fit log contains unsupported fit_status values: {unexpected}")
+
+    active = frame.loc[frame["fit_status"].eq("candidate_fit")].copy()
+    skipped = frame.loc[frame["fit_status"].eq("skipped_insufficient_train_rows")].copy()
+    bad_active = active.loc[
+        active["selected_alpha"].isna()
+        | active["selected_alpha"].lt(0)
+        | active["train_rows_used"].le(0)
+        | active["test_rows_scored"].le(0)
+    ]
+    if not bad_active.empty:
+        raise RuntimeError(
+            "Active fit contracts require finite alpha and positive train/test rows: "
+            f"{bad_active[required].head(20).to_dict(orient='records')}"
+        )
+    bad_skipped = skipped.loc[
+        skipped["selected_alpha"].notna() | skipped["test_rows_scored"].ne(0)
+    ]
+    if not bad_skipped.empty:
+        raise RuntimeError(
+            "Skipped fit contracts must have blank alpha and zero scored test rows: "
+            f"{bad_skipped[required].head(20).to_dict(orient='records')}"
         )
 
-    negative_rows = frame.loc[frame["train_rows_used"].lt(0)]
-    if not negative_rows.empty:
-        raise RuntimeError(
-            "Fit log contains negative train_rows_used values: "
-            f"{negative_rows[['tenor', 'test_year', 'train_rows_used']].head(20).to_dict(orient='records')}"
-        )
-
-    bad_alpha = frame["selected_alpha"].notna() & frame["selected_alpha"].lt(0)
-    if bad_alpha.any():
-        raise RuntimeError(
-            "Fit log contains negative selected_alpha values: "
-            f"{frame.loc[bad_alpha, ['tenor', 'test_year', 'selected_alpha']].head(20).to_dict(orient='records')}"
-        )
-
-    frame["tenor"] = frame["tenor"].astype(int)
-    frame["test_year"] = frame["test_year"].astype(int)
-    frame["train_rows_used"] = frame["train_rows_used"].astype(int)
-
-    # The canonical fit log includes pre-model bookkeeping rows (for example, 2018)
-    # with train_rows_used == 0. They are not fit instructions. Accept them only when
-    # they occur strictly before that tenor's first active positive-row contract, then
-    # remove them from the fit table. A zero-row entry inside or after the active fit
-    # history is treated as a malformed production contract.
-    placeholder = frame.loc[frame["train_rows_used"].eq(0)].copy()
-    active = frame.loc[frame["train_rows_used"].gt(0)].copy()
-
+    for column in ["tenor", "test_year", "train_rows_used", "test_rows_scored"]:
+        active[column] = active[column].astype(int)
+    active.attrs["ignored_skipped_rows"] = int(len(skipped))
+    active.attrs["ignored_skipped_contracts"] = skipped[
+        ["tenor", "test_year", "fit_status", "train_rows_used", "test_rows_scored"]
+    ].to_dict(orient="records")
     missing_active_tenors = sorted(set(EXPECTED_TENORS) - set(active["tenor"].unique()))
     if missing_active_tenors:
-        raise RuntimeError(
-            f"Fit log has no active positive-row contract for tenors: {missing_active_tenors}"
-        )
-
-    invalid_placeholders: list[dict[str, int]] = []
-    for row in placeholder.itertuples(index=False):
-        first_active_year = int(
-            active.loc[active["tenor"].eq(int(row.tenor)), "test_year"].min()
-        )
-        if int(row.test_year) >= first_active_year:
-            invalid_placeholders.append({
-                "tenor": int(row.tenor),
-                "test_year": int(row.test_year),
-                "train_rows_used": int(row.train_rows_used),
-                "first_active_year": first_active_year,
-            })
-    if invalid_placeholders:
-        raise RuntimeError(
-            "Fit log contains zero-row contracts inside or after the active fit history: "
-            f"{invalid_placeholders[:20]}"
-        )
-
-    active.attrs["ignored_placeholder_rows"] = int(len(placeholder))
-    active.attrs["ignored_placeholder_contracts"] = placeholder[
-        ["tenor", "test_year", "train_rows_used"]
-    ].to_dict(orient="records")
+        raise RuntimeError(f"Fit log has no active fitted contracts for tenors: {missing_active_tenors}")
     return active.sort_values(["tenor", "test_year"]).reset_index(drop=True)
 
 
@@ -406,80 +400,6 @@ def _make_ridge(alpha: float) -> Pipeline:
 def _finite_complete_rows(frame: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
     values = frame[list(columns)].to_numpy(dtype=float)
     return frame.loc[np.isfinite(values).all(axis=1)].copy()
-
-
-def select_missing_canonical_alpha(
-    contract_train: pd.DataFrame,
-) -> tuple[float, pd.DataFrame]:
-    """Reproduce the locked train-only yearly walk-forward alpha fallback.
-
-    The canonical fit log occasionally carries an intentionally blank selected_alpha while retaining
-    the exact train_rows_used contract. Historical reconstruction resolves that case by selecting
-    alpha on the trimmed benchmark-contract training sample using yearly walk-forward validation.
-    This function preserves that exact behavior; it does not tune on the current test year.
-    """
-    rows: list[dict[str, Any]] = []
-    years = sorted(int(y) for y in contract_train["date"].dt.year.dropna().unique())
-
-    for alpha in ALPHA_GRID:
-        squared_errors: list[np.ndarray] = []
-        fold_count = 0
-        validation_rows = 0
-
-        for validation_year in years:
-            validation_start = pd.Timestamp(year=validation_year, month=1, day=1)
-            validation_end = pd.Timestamp(year=validation_year + 1, month=1, day=1)
-            inner_train = contract_train.loc[
-                contract_train["date"].lt(validation_start)
-                & contract_train[LEAKAGE_DATE_COL].notna()
-                & contract_train[LEAKAGE_DATE_COL].lt(validation_start)
-            ].copy()
-            inner_validation = contract_train.loc[
-                contract_train["date"].ge(validation_start)
-                & contract_train["date"].lt(validation_end)
-            ].copy()
-            required = BENCHMARK_CONTRACT_FEATURES + [TARGET_LOG_COL]
-            inner_train = _finite_complete_rows(inner_train, required)
-            inner_validation = _finite_complete_rows(inner_validation, required)
-            if len(inner_train) < MIN_INNER_TRAIN_ROWS or len(inner_validation) < MIN_INNER_VAL_ROWS:
-                continue
-
-            model = _make_ridge(alpha)
-            model.fit(
-                inner_train[BENCHMARK_CONTRACT_FEATURES].to_numpy(dtype=float),
-                inner_train[TARGET_LOG_COL].to_numpy(dtype=float),
-            )
-            prediction = model.predict(
-                inner_validation[BENCHMARK_CONTRACT_FEATURES].to_numpy(dtype=float)
-            )
-            error = prediction - inner_validation[TARGET_LOG_COL].to_numpy(dtype=float)
-            squared_errors.append(error ** 2)
-            fold_count += 1
-            validation_rows += len(inner_validation)
-
-        pooled_rmse = (
-            float(np.sqrt(np.mean(np.concatenate(squared_errors))))
-            if squared_errors else float("nan")
-        )
-        rows.append({
-            "alpha": float(alpha),
-            "inner_fold_count": int(fold_count),
-            "inner_validation_rows": int(validation_rows),
-            "pooled_rmse": pooled_rmse,
-        })
-
-    audit = pd.DataFrame(rows)
-    usable = audit.loc[np.isfinite(audit["pooled_rmse"])].copy()
-    if usable.empty:
-        selected = float(FALLBACK_ALPHA)
-    else:
-        order = {float(alpha): index for index, alpha in enumerate(ALPHA_GRID)}
-        usable["alpha_grid_order"] = usable["alpha"].map(order)
-        selected = float(
-            usable.sort_values(["pooled_rmse", "alpha_grid_order"]).iloc[0]["alpha"]
-        )
-    audit["selected"] = audit["alpha"].eq(selected)
-    return selected, audit
 
 
 def load_forecast_benchmark_keys(path: Path, target_date: pd.Timestamp) -> pd.DataFrame:
@@ -581,17 +501,9 @@ def build_locked_forecast_history(
                     f"The locked intraday model loses benchmark-contract training rows for {tenor}D/{year}."
                 )
 
-            if np.isfinite(reference_alpha):
-                alpha = float(reference_alpha)
-                alpha_source = "fit_log_selected_alpha"
-                alpha_cv = pd.DataFrame()
-            else:
-                alpha, alpha_cv = select_missing_canonical_alpha(contract_train)
-                alpha_source = "recomputed_locked_inner_yearly_cv"
-                alpha_cv = alpha_cv.copy()
-                alpha_cv["tenor"] = tenor
-                alpha_cv["test_year"] = year
-                alpha_cv["reference_selected_alpha"] = reference_alpha
+            alpha = float(reference_alpha)
+            alpha_source = "fit_log_selected_alpha"
+            alpha_cv = pd.DataFrame()
 
             if not np.isfinite(alpha) or alpha < 0:
                 raise RuntimeError(
@@ -671,6 +583,7 @@ def validate_locked_forecast_reference(
     forecast: pd.DataFrame,
     reference_path: Path,
     tolerance: float = 1e-8,
+    allow_difference: bool = False,
 ) -> dict[str, Any]:
     if not reference_path.exists():
         raise FileNotFoundError(f"Locked intraday forecast reference is missing: {reference_path}")
@@ -730,7 +643,8 @@ def validate_locked_forecast_reference(
         ),
         "forecast_vol_pct": float((joined["forecast_vol_pct"] - joined["ref_vol"]).abs().max()),
     }
-    if any(value > tolerance for value in diffs.values()):
+    within_tolerance = not any(value > tolerance for value in diffs.values())
+    if not within_tolerance and not allow_difference:
         raise RuntimeError(
             f"Locked intraday forecast reconstruction differs from reference beyond {tolerance}: {diffs}"
         )
@@ -739,6 +653,8 @@ def validate_locked_forecast_reference(
         "compared_rows": int(len(joined)),
         "tolerance": tolerance,
         "max_abs_differences": diffs,
+        "within_tolerance": within_tolerance,
+        "difference_allowed_for_staging": bool(allow_difference and not within_tolerance),
         "reference_date_start": str(reference["date"].min().date()),
         "reference_date_end": str(reference["date"].max().date()),
     }
@@ -1190,6 +1106,10 @@ def apply_lock(
 
 
 def run_publish(config: PublishConfig) -> dict[str, Any]:
+    if config.publish and config.allow_reference_difference:
+        raise RuntimeError(
+            "--allow-reference-difference is staging-only and cannot be combined with --publish."
+        )
     runtime, runtime_path = load_runtime_config(config.project_root, config.runtime_config_path)
     lock = load_json(config.lock_config_path)
     thresholds, sizes = expand_lock_tables(lock)
@@ -1204,14 +1124,16 @@ def run_publish(config: PublishConfig) -> dict[str, Any]:
         features, fit_log, benchmark_keys, config.target_date
     )
     forecast_reference_audit = validate_locked_forecast_reference(
-        forecast, config.locked_forecast_reference
+        forecast,
+        config.locked_forecast_reference,
+        allow_difference=config.allow_reference_difference,
     )
     implied = load_implied_variance(config.implied_variance, config.target_date)
     eod = load_spy_eod(config.spy_eod, config.target_date)
     rsi_history, rsi_audit = load_accepted_wilder_rsi(
         config.rsi_history,
         config.target_date,
-        list(runtime.get("accepted_rsi_versions", ["wilder_rsi14_spy_close_v2_long_warmup"])),
+        list(runtime.get("accepted_rsi_versions", ["wilder_rsi14_spy_close_v3_clean_session_rebuild"])),
     )
     rv, rv21d_audit = load_rv21d(
         config.rv21d, config.target_date, forecast["date"]
@@ -1304,6 +1226,7 @@ def run_publish(config: PublishConfig) -> dict[str, Any]:
         "rv21d_audit": rv21d_audit,
         "staged_outputs": {k: str(v) for k, v in paths.items()},
         "published": bool(config.publish),
+        "allow_reference_difference": bool(config.allow_reference_difference),
     }
     write_json(paths["manifest"], manifest)
 
@@ -1352,6 +1275,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fit_log=_resolve_explicit_or_runtime(args.fit_log, project_root, runtime, canonical_key="fit_log"),
         staging_dir=args.staging_dir.resolve(),
         publish=bool(args.publish),
+        allow_reference_difference=bool(args.allow_reference_difference),
     )
     assert config.rsi_history is not None
     manifest = run_publish(config)

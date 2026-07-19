@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 
 import argparse
 import json
@@ -370,77 +371,49 @@ def _inspect_fit_log(path: Path, target_year: int) -> dict[str, Any]:
         return row
     try:
         frame = pd.read_csv(path)
-        required = {"model_spec", "tenor", "test_year", "selected_alpha", "train_rows_used"}
+        required = {
+            "model_spec", "tenor", "test_year", "fit_status", "selected_alpha",
+            "train_rows_used", "test_rows_scored",
+        }
         missing = sorted(required - set(frame.columns))
         if missing:
             raise RuntimeError(f"missing_columns={missing}")
-        subset = frame.loc[
-            frame["model_spec"].astype(str).eq("unified_fds_no_min_return")
-        ].copy()
-        subset["tenor"] = pd.to_numeric(subset["tenor"], errors="coerce")
-        subset["test_year"] = pd.to_numeric(subset["test_year"], errors="coerce")
-        subset["selected_alpha"] = pd.to_numeric(subset["selected_alpha"], errors="coerce")
-        subset["train_rows_used"] = pd.to_numeric(subset["train_rows_used"], errors="coerce")
-
-        duplicates = subset.duplicated(["tenor", "test_year"], keep=False).sum()
-        identity_ok = (
-            subset["tenor"].notna().all()
-            and subset["test_year"].notna().all()
-            and subset["train_rows_used"].notna().all()
-        )
-        nonnegative_rows_ok = subset["train_rows_used"].ge(0).all()
-        alpha_values_ok = (subset["selected_alpha"].isna() | subset["selected_alpha"].ge(0)).all()
-
-        active = subset.loc[subset["train_rows_used"].gt(0)].copy()
-        placeholders = subset.loc[subset["train_rows_used"].eq(0)].copy()
-        placeholder_contracts_ok = True
-        invalid_placeholder_rows: list[dict[str, int]] = []
-        if identity_ok and nonnegative_rows_ok:
-            for placeholder_row in placeholders.itertuples(index=False):
-                tenor_active = active.loc[active["tenor"].eq(placeholder_row.tenor)]
-                if tenor_active.empty:
-                    placeholder_contracts_ok = False
-                    invalid_placeholder_rows.append({
-                        "tenor": int(placeholder_row.tenor),
-                        "test_year": int(placeholder_row.test_year),
-                        "reason": "no active positive-row contract",
-                    })
-                    continue
-                first_active_year = int(tenor_active["test_year"].min())
-                if int(placeholder_row.test_year) >= first_active_year:
-                    placeholder_contracts_ok = False
-                    invalid_placeholder_rows.append({
-                        "tenor": int(placeholder_row.tenor),
-                        "test_year": int(placeholder_row.test_year),
-                        "first_active_year": first_active_year,
-                    })
-
+        subset = frame.loc[frame["model_spec"].astype(str).eq("unified_fds_no_min_return")].copy()
+        for column in ["tenor", "test_year", "selected_alpha", "train_rows_used", "test_rows_scored"]:
+            subset[column] = pd.to_numeric(subset[column], errors="coerce")
+        subset["fit_status"] = subset["fit_status"].astype(str).str.strip()
+        duplicates = int(subset.duplicated(["tenor", "test_year"], keep=False).sum())
+        allowed = {"candidate_fit", "skipped_insufficient_train_rows"}
+        unexpected = sorted(set(subset["fit_status"]) - allowed)
+        active = subset.loc[subset["fit_status"].eq("candidate_fit")].copy()
+        skipped = subset.loc[subset["fit_status"].eq("skipped_insufficient_train_rows")].copy()
+        active_valid = bool(len(active)) and not (
+            active["selected_alpha"].isna()
+            | active["selected_alpha"].lt(0)
+            | active["train_rows_used"].le(0)
+            | active["test_rows_scored"].le(0)
+        ).any()
+        skipped_valid = not (
+            skipped["selected_alpha"].notna() | skipped["test_rows_scored"].ne(0)
+        ).any()
         current = active.loc[active["test_year"].eq(target_year)].copy()
         tenors = sorted(current["tenor"].dropna().astype(int).unique())
-        train_rows_ok = current["train_rows_used"].notna().all() and current["train_rows_used"].gt(0).all()
-        missing_alpha_tenors = sorted(
-            current.loc[current["selected_alpha"].isna(), "tenor"].dropna().astype(int).unique()
-        )
         ok = (
-            tenors == EXPECTED_TENORS
-            and duplicates == 0
-            and identity_ok
-            and nonnegative_rows_ok
-            and alpha_values_ok
-            and placeholder_contracts_ok
-            and train_rows_ok
+            duplicates == 0
+            and not unexpected
+            and active_valid
+            and skipped_valid
+            and tenors == EXPECTED_TENORS
         )
         row.update({
             "row_count": int(len(subset)),
-            "duplicate_key_rows": int(duplicates),
+            "duplicate_key_rows": duplicates,
             "status": "PASS" if ok else "ERROR",
             "detail": (
-                f"target_year={target_year}; tenors={tenors}; train_rows_ok={train_rows_ok}; "
-                f"alpha_values_ok={alpha_values_ok}; missing_alpha_tenors={missing_alpha_tenors}; "
-                f"ignored_pre_model_placeholder_rows={len(placeholders)}; "
-                f"placeholder_contracts_ok={placeholder_contracts_ok}; "
-                f"invalid_placeholder_rows={invalid_placeholder_rows[:10]}; "
-                "blank alpha policy=locked yearly walk-forward reselection in publisher"
+                f"target_year={target_year}; active_tenors={tenors}; active_rows={len(active)}; "
+                f"skipped_rows={len(skipped)}; active_contracts_valid={active_valid}; "
+                f"skipped_contracts_valid={skipped_valid}; unsupported_statuses={unexpected}; "
+                "blank-alpha fallback is prohibited"
             ),
         })
     except Exception as exc:
@@ -540,6 +513,94 @@ def _inspect_spy_eod(path: Path, target_date: pd.Timestamp, start_date: pd.Times
     return row
 
 
+def _inspect_feature_spy_contract(
+    feature_path: Path | None,
+    spy_path: Path,
+    target_date: pd.Timestamp,
+) -> dict[str, Any]:
+    row = {
+        "component": "feature_spy_source_contract",
+        "path": str(feature_path) if feature_path else None,
+        "exists": bool(feature_path and feature_path.exists() and spy_path.exists()),
+        "status": "MISSING",
+        "row_count": 0,
+        "earliest_date": None,
+        "latest_date": None,
+        "missing_date_count": None,
+        "interior_missing_count": None,
+        "recent_missing_count": None,
+        "missing_tenor_cells": None,
+        "duplicate_key_rows": None,
+        "detail": "Feature panel or canonical SPY source missing.",
+    }
+    if feature_path is None or not feature_path.exists() or not spy_path.exists():
+        return row
+    try:
+        feature = read_table(feature_path)
+        spy = read_table(spy_path)
+        required_feature = {
+            "date", "tenor", "spy_close_for_features", "spy_log_return",
+            "feature_return_source", "spx_close_for_features", "spx_log_return",
+        }
+        missing_feature = sorted(required_feature - set(feature.columns))
+        if missing_feature:
+            raise RuntimeError(f"feature panel missing columns={missing_feature}")
+        if not {"trade_date", "spy_close"}.issubset(spy.columns):
+            raise RuntimeError("canonical SPY file missing trade_date/spy_close")
+
+        feature_work = pd.DataFrame({
+            "date": normalize_dates(feature["date"]),
+            "tenor": normalize_tenor(feature["tenor"]),
+            "feature_close": pd.to_numeric(feature["spy_close_for_features"], errors="coerce"),
+            "feature_return": pd.to_numeric(feature["spy_log_return"], errors="coerce"),
+            "legacy_close": pd.to_numeric(feature["spx_close_for_features"], errors="coerce"),
+            "legacy_return": pd.to_numeric(feature["spx_log_return"], errors="coerce"),
+            "source": feature["feature_return_source"].astype(str),
+        })
+        spy_work = pd.DataFrame({
+            "date": normalize_dates(spy["trade_date"]),
+            "spy_close": pd.to_numeric(spy["spy_close"], errors="coerce"),
+        }).sort_values("date").drop_duplicates("date", keep="last")
+        spy_work["expected_return"] = np.log(spy_work["spy_close"] / spy_work["spy_close"].shift(1))
+
+        target = feature_work.loc[feature_work["date"].eq(target_date)].copy()
+        target = target.loc[target["tenor"].isin(EXPECTED_TENORS)]
+        canonical_target = spy_work.loc[spy_work["date"].eq(target_date)]
+        if len(target) != len(EXPECTED_TENORS) or len(canonical_target) != 1:
+            raise RuntimeError(
+                f"target rows invalid: feature_rows={len(target)}, canonical_spy_rows={len(canonical_target)}"
+            )
+        expected_close = float(canonical_target.iloc[0]["spy_close"])
+        expected_return = float(canonical_target.iloc[0]["expected_return"])
+        close_diff = float((target["feature_close"] - expected_close).abs().max())
+        return_diff = float((target["feature_return"] - expected_return).abs().max())
+        legacy_close_diff = float((target["legacy_close"] - target["feature_close"]).abs().max())
+        legacy_return_diff = float((target["legacy_return"] - target["feature_return"]).abs().max())
+        source_ok = target["source"].eq("SPY").all()
+        source_constant = target["feature_close"].nunique(dropna=False) == 1
+        ok = (
+            source_constant and source_ok
+            and np.isfinite(close_diff) and close_diff <= 1e-10
+            and np.isfinite(return_diff) and return_diff <= 1e-12
+            and legacy_close_diff <= 1e-12 and legacy_return_diff <= 1e-12
+        )
+        row.update({
+            "row_count": int(len(feature_work)),
+            "latest_date": str(feature_work["date"].max().date()),
+            "status": "PASS" if ok else "ERROR",
+            "detail": (
+                f"target={target_date.date()}; canonical_spy_close={expected_close:.8f}; "
+                f"max_close_diff={close_diff:.3e}; max_return_diff={return_diff:.3e}; "
+                f"legacy_close_diff={legacy_close_diff:.3e}; "
+                f"legacy_return_diff={legacy_return_diff:.3e}; "
+                f"source_spy={source_ok}; SPX/generic fallback prohibited"
+            ),
+        })
+    except Exception as exc:
+        row["status"] = "ERROR"
+        row["detail"] = f"Could not validate feature/SPY source identity: {exc}"
+    return row
+
 def _inspect_locked_intraday_reference(path: Path) -> dict[str, Any]:
     row = _base_static_row("locked_intraday_forecast_reference", path)
     if not path.exists():
@@ -624,6 +685,76 @@ def _inspect_static_tiebreaks(path: Path) -> dict[str, Any]:
     return row
 
 
+def _inspect_wilder_rsi_recurrence(rsi_path: Path, spy_path: Path) -> dict[str, Any]:
+    row = _base_static_row("wilder_rsi_recurrence", rsi_path)
+    if not rsi_path.exists() or not spy_path.exists():
+        row["detail"] = f"rsi_exists={rsi_path.exists()}; spy_exists={spy_path.exists()}"
+        return row
+    try:
+        rsi = read_table(rsi_path).copy()
+        spy = read_table(spy_path).copy()
+        rsi_date = first_existing_column(rsi, ("trade_date", "date"), label="RSI date")
+        spy_date = first_existing_column(spy, ("trade_date", "date"), label="SPY date")
+        spy_close_col = first_existing_column(spy, ("spy_close", "close"), label="SPY close")
+        rsi_close_col = first_existing_column(rsi, ("spy_close", "close"), label="RSI close")
+        change_col = first_existing_column(rsi, ("spy_change", "change"), label="RSI change")
+        gain_col = first_existing_column(rsi, ("wilder_avg_gain_14", "avg_gain_14"), label="average gain")
+        loss_col = first_existing_column(rsi, ("wilder_avg_loss_14", "avg_loss_14"), label="average loss")
+        value_col = first_existing_column(rsi, ("spy_wilder_rsi14", "rsi14"), label="RSI value")
+        work = pd.DataFrame({
+            "date": normalize_dates(rsi[rsi_date]),
+            "stored_close": pd.to_numeric(rsi[rsi_close_col], errors="coerce"),
+            "stored_change": pd.to_numeric(rsi[change_col], errors="coerce"),
+            "stored_gain": pd.to_numeric(rsi[gain_col], errors="coerce"),
+            "stored_loss": pd.to_numeric(rsi[loss_col], errors="coerce"),
+            "stored_rsi": pd.to_numeric(rsi[value_col], errors="coerce"),
+        }).dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+        canonical = pd.DataFrame({
+            "date": normalize_dates(spy[spy_date]),
+            "canonical_close": pd.to_numeric(spy[spy_close_col], errors="coerce"),
+        }).dropna(subset=["date"]).drop_duplicates("date", keep="last")
+        work = work.merge(canonical, on="date", how="left", validate="one_to_one")
+        if len(work) < 2 or work["canonical_close"].isna().any():
+            raise RuntimeError("RSI recurrence check lacks complete canonical SPY coverage.")
+        expected_change = work["canonical_close"].diff()
+        expected_gain = pd.Series(np.nan, index=work.index, dtype=float)
+        expected_loss = pd.Series(np.nan, index=work.index, dtype=float)
+        expected_rsi = pd.Series(np.nan, index=work.index, dtype=float)
+        expected_gain.iloc[0] = work.loc[0, "stored_gain"]
+        expected_loss.iloc[0] = work.loc[0, "stored_loss"]
+        expected_rsi.iloc[0] = work.loc[0, "stored_rsi"]
+        for idx in range(1, len(work)):
+            change = float(expected_change.iloc[idx])
+            expected_gain.iloc[idx] = (expected_gain.iloc[idx-1] * 13.0 + max(change, 0.0)) / 14.0
+            expected_loss.iloc[idx] = (expected_loss.iloc[idx-1] * 13.0 + max(-change, 0.0)) / 14.0
+            if math.isclose(expected_loss.iloc[idx], 0.0, abs_tol=1e-15):
+                expected_rsi.iloc[idx] = 50.0 if math.isclose(expected_gain.iloc[idx], 0.0, abs_tol=1e-15) else 100.0
+            else:
+                rs = expected_gain.iloc[idx] / expected_loss.iloc[idx]
+                expected_rsi.iloc[idx] = 100.0 - 100.0 / (1.0 + rs)
+        def mdiff(a, b):
+            values = (pd.to_numeric(a, errors="coerce") - pd.to_numeric(b, errors="coerce")).abs().iloc[1:].dropna()
+            return float(values.max()) if len(values) else 0.0
+        diffs = {
+            "close": mdiff(work["stored_close"], work["canonical_close"]),
+            "change": mdiff(work["stored_change"], expected_change),
+            "avg_gain": mdiff(work["stored_gain"], expected_gain),
+            "avg_loss": mdiff(work["stored_loss"], expected_loss),
+            "rsi": mdiff(work["stored_rsi"], expected_rsi),
+        }
+        tolerance = 1e-10
+        ok = max(diffs.values()) <= tolerance
+        row.update({
+            "row_count": int(len(work)),
+            "status": "PASS" if ok else "ERROR",
+            "detail": f"max_abs_differences={diffs}; tolerance={tolerance}",
+        })
+    except Exception as exc:
+        row["status"] = "ERROR"
+        row["detail"] = str(exc)
+    return row
+
+
 def run_health_check(config: HealthConfig) -> tuple[pd.DataFrame, dict[str, Any]]:
     runtime, runtime_path = load_runtime_config(config.project_root, config.runtime_config_path)
     close_buffer = int(runtime.get("close_buffer_minutes", 15))
@@ -691,10 +822,15 @@ def run_health_check(config: HealthConfig) -> tuple[pd.DataFrame, dict[str, Any]
     rows.append(_inspect_static_tiebreaks(static_tiebreak_path))
 
     spy_start = pd.Timestamp(component_starts.get("spy_eod", runtime.get("history_start", "2018-01-01")))
+    spy_path = component_path(config.project_root, runtime, "spy_eod")
     rows.append(_inspect_spy_eod(
-        component_path(config.project_root, runtime, "spy_eod"),
+        spy_path,
         target_date,
         spy_start,
+    ))
+    rows.append(_inspect_wilder_rsi_recurrence(
+        component_path(config.project_root, runtime, "wilder_rsi"),
+        spy_path,
     ))
 
     table_specs = [
@@ -759,8 +895,10 @@ def run_health_check(config: HealthConfig) -> tuple[pd.DataFrame, dict[str, Any]
                     rows[idx]["detail"] = f"Could not validate RSI semantic contract: {exc}"
                     break
 
+    discovered_paths: dict[str, Path | None] = {}
     for discovery_name in ("corsi_source", "feature_panel"):
         path = glob_latest(config.project_root, runtime["discovery"].get(discovery_name, []))
+        discovered_paths[discovery_name] = path
         start = pd.Timestamp(component_starts.get(discovery_name, "2018-06-25"))
         rows.append(_inspect_table(
             name=discovery_name,
@@ -770,6 +908,13 @@ def run_health_check(config: HealthConfig) -> tuple[pd.DataFrame, dict[str, Any]
             expected_tenors=EXPECTED_TENORS,
             require_target=True,
         ))
+
+    spy_path = component_path(config.project_root, runtime, "spy_eod")
+    rows.append(_inspect_feature_spy_contract(
+        discovered_paths.get("feature_panel"),
+        spy_path,
+        target_date,
+    ))
 
     frame = pd.DataFrame(rows)
     hard_components = {
@@ -782,8 +927,10 @@ def run_health_check(config: HealthConfig) -> tuple[pd.DataFrame, dict[str, Any]
         "locked_forecast_benchmark",
         "locked_intraday_forecast_reference",
         "spy_eod",
+        "feature_spy_source_contract",
         "rv21d",
         "wilder_rsi",
+        "wilder_rsi_recurrence",
         "implied_variance",
         "corsi_source",
         "feature_panel",

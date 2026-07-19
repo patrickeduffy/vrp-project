@@ -63,6 +63,11 @@ try:
 except Exception:  # pragma: no cover - optional dependency on user machine
     mcal = None
 
+try:
+    import exchange_calendars as xcals  # type: ignore
+except Exception:  # pragma: no cover - optional fallback
+    xcals = None
+
 
 # ======================================================================================
 # Defaults
@@ -128,6 +133,77 @@ class Config:
     quote_time: Optional[str]
 
 
+
+def _coerce_yyyymmdd_date(value: Any) -> pd.Timestamp:
+    """Normalize YYYYMMDD/date-like inputs to a naive midnight Timestamp."""
+    if isinstance(value, int) or (
+        isinstance(value, str) and value.isdigit() and len(value) == 8
+    ):
+        return pd.Timestamp(pd.to_datetime(str(value), format="%Y%m%d", errors="raise")).normalize()
+    return pd.Timestamp(pd.to_datetime(value, errors="raise")).normalize()
+
+
+def production_spxw_settlement_minutes(expiration_date: Any) -> int:
+    """Return the official XNYS close minute for a PM-settled SPXW expiration.
+
+    Normal sessions settle at 16:00 ET. Early-close expirations settle at the
+    actual exchange close (generally 13:00 ET). A missing calendar dependency or
+    non-session expiration is a hard error; production must not silently assume
+    a normal close.
+    """
+    exp_ts = _coerce_yyyymmdd_date(expiration_date)
+    if mcal is not None:
+        cal = mcal.get_calendar("XNYS")
+        schedule = cal.schedule(start_date=exp_ts.date(), end_date=exp_ts.date())
+        if schedule.empty:
+            raise RuntimeError(
+                f"SPXW expiration {exp_ts.date()} is not an XNYS trading session."
+            )
+        close_ts = schedule.iloc[0]["market_close"]
+    elif xcals is not None:
+        cal = xcals.get_calendar("XNYS")
+        if not cal.is_session(exp_ts):
+            raise RuntimeError(
+                f"SPXW expiration {exp_ts.date()} is not an XNYS trading session."
+            )
+        close_ts = cal.session_close(exp_ts)
+    else:
+        raise RuntimeError(
+            "An XNYS calendar package is required for expiration-aware SPXW settlement timing."
+        )
+    if close_ts.tzinfo is None:
+        close_ts = close_ts.tz_localize("UTC")
+    close_et = close_ts.tz_convert("America/New_York")
+    return int(close_et.hour * 60 + close_et.minute)
+
+
+def production_settlement_minutes_after_midnight_et(root: str, expiration_date: Any) -> int:
+    """Settlement minute used by the repaired VIX-style expiration clock."""
+    root_text = str(root).upper()
+    if root_text == "SPX":
+        return 9 * 60 + 30
+    if root_text == "SPXW":
+        return production_spxw_settlement_minutes(expiration_date)
+    raise ValueError(f"Unknown option root: {root!r}")
+
+
+def production_minutes_to_expiry_vix_method(
+    trade_date: Any,
+    exp_yyyymmdd: Any,
+    root: str,
+    calc_time_ms: int,
+) -> int:
+    """Minutes from quote time to expiration using the expiration's actual schedule."""
+    trade_ts = _coerce_yyyymmdd_date(trade_date)
+    expiration_ts = _coerce_yyyymmdd_date(exp_yyyymmdd)
+    calculation_minutes = int(calc_time_ms // 60000)
+    settlement_minutes = production_settlement_minutes_after_midnight_et(
+        root, exp_yyyymmdd
+    )
+    calendar_days = int((expiration_ts - trade_ts).days)
+    return calendar_days * 24 * 60 + settlement_minutes - calculation_minutes
+
+
 def now_stamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -184,6 +260,34 @@ def parse_trade_date_series(series: pd.Series) -> pd.Series:
     if as_str.dropna().str.fullmatch(r"\d{8}").all():
         return pd.to_datetime(as_str, format="%Y%m%d", errors="raise").dt.normalize()
     return pd.to_datetime(s, errors="raise").dt.normalize()
+
+
+def select_prior_rate_record(
+    rates: pd.DataFrame, trade_date: Any, symbol: str = "SOFR"
+) -> Dict[str, Any]:
+    """Select the latest rate observation strictly before trade_date."""
+    td = pd.Timestamp(trade_date)
+    if isinstance(trade_date, int) or (
+        isinstance(trade_date, str) and trade_date.isdigit() and len(trade_date) == 8
+    ):
+        td = pd.to_datetime(str(trade_date), format="%Y%m%d")
+    td = pd.Timestamp(td).normalize()
+    work = rates.copy()
+    if "trade_date" not in work.columns or "rate_decimal" not in work.columns:
+        raise KeyError("Rate history requires trade_date and rate_decimal columns.")
+    work["trade_date"] = parse_trade_date_series(work["trade_date"])
+    work["rate_decimal"] = pd.to_numeric(work["rate_decimal"], errors="coerce")
+    work = work.loc[work["trade_date"].lt(td) & work["rate_decimal"].notna()].copy()
+    if work.empty:
+        raise ValueError(f"No {symbol} observation exists strictly before {td.date()}")
+    selected = work.sort_values("trade_date").iloc[-1]
+    rate_decimal = float(selected["rate_decimal"])
+    return {
+        "rate_observation_date": pd.Timestamp(selected["trade_date"]).normalize(),
+        "rate_decimal": rate_decimal,
+        "rate_pct": rate_decimal * 100.0,
+        "rate_selection_rule": "latest_observation_strictly_before_trade_date",
+    }
 
 
 def date_str(ts: Any) -> str:
@@ -686,37 +790,13 @@ def build_vix_namespace(cfg: Config) -> Tuple[Dict[str, Any], pd.DataFrame, pd.D
             rate_decimal
             rate_pct
         """
-        candidate_paths = []
-
-        explicit_paths = [
-            cfg.external_dir / "fred_sofr_history.csv",
-            cfg.external_dir / "sofr_history.csv",
-            cfg.external_dir / "SOFR.csv",
-            cfg.project_root / "data" / "external" / "fred_sofr_history.csv",
-            cfg.project_root / "data" / "external" / "sofr_history.csv",
-        ]
-
-        for path in explicit_paths:
-            if path.exists():
-                candidate_paths.append(path)
-
-        for base in [
-            cfg.project_root / "data" / "external",
-            cfg.project_root / "data" / "raw",
-            cfg.project_root / "data" / "processed",
-        ]:
-            if base.exists():
-                candidate_paths.extend(sorted(base.glob("*sofr*.csv")))
-                candidate_paths.extend(sorted(base.glob("*SOFR*.csv")))
-
-        # De-duplicate while preserving order.
-        deduped = []
-        seen = set()
-        for path in candidate_paths:
-            key = str(path).lower()
-            if key not in seen:
-                deduped.append(path)
-                seen.add(key)
+        canonical_path = cfg.external_dir / "fred_sofr_history.csv"
+        if not canonical_path.exists():
+            raise FileNotFoundError(
+                "Canonical SOFR cache is required for implied variance: "
+                f"{canonical_path}"
+            )
+        deduped = [canonical_path]
 
         last_error = None
 
@@ -801,36 +881,42 @@ def build_vix_namespace(cfg: Config) -> Tuple[Dict[str, Any], pd.DataFrame, pd.D
                 continue
 
         raise FileNotFoundError(
-            "Could not load SOFR/rate history for implied variance updater. "
-            f"Searched under {cfg.external_dir} and project data dirs. "
+            "Could not load the canonical SOFR history for implied variance. "
+            f"Required path={cfg.external_dir / 'fred_sofr_history.csv'}. "
             f"Last error: {last_error!r}"
         )
 
-    def get_interest_rate_for_date_v3(symbol="SOFR", trade_date=None):
-        """
-        Return decimal rate for trade_date using latest available SOFR <= trade_date.
+    def get_interest_rate_record_for_date_v3(symbol="SOFR", trade_date=None):
+        """Return the latest SOFR observation strictly before trade_date.
+
+        This is the production point-in-time convention. A same-date fixing is not
+        available at that date's market close, so the observation date must satisfy
+        observation_date < trade_date. The latest prior observation naturally carries
+        across weekends and market holidays.
         """
         if trade_date is None:
             raise ValueError("trade_date is required")
 
         td = pd.Timestamp(trade_date)
-
         if isinstance(trade_date, int) or (
             isinstance(trade_date, str) and trade_date.isdigit() and len(trade_date) == 8
         ):
             td = pd.to_datetime(str(trade_date), format="%Y%m%d")
-
         td = pd.Timestamp(td).normalize()
 
         rates = get_interest_rate_history_eod_v3(symbol=symbol).copy()
-        rates = rates[rates["trade_date"] <= td].copy()
+        return select_prior_rate_record(rates, td, symbol=symbol)
 
-        if rates.empty:
-            raise ValueError(f"No {symbol} rate available on or before {td.date()}")
-
-        return float(rates.iloc[-1]["rate_decimal"])
+    def get_interest_rate_for_date_v3(symbol="SOFR", trade_date=None):
+        """Compatibility wrapper returning the selected T-1 rate in decimal form."""
+        return float(
+            get_interest_rate_record_for_date_v3(symbol=symbol, trade_date=trade_date)[
+                "rate_decimal"
+            ]
+        )
 
     ns["get_interest_rate_history_eod_v3"] = get_interest_rate_history_eod_v3
+    ns["get_interest_rate_record_for_date_v3"] = get_interest_rate_record_for_date_v3
     ns["get_interest_rate_for_date_v3"] = get_interest_rate_for_date_v3
 
     # Historical naming compatibility.
@@ -1358,6 +1444,22 @@ def build_vix_namespace(cfg: Config) -> Tuple[Dict[str, Any], pd.DataFrame, pd.D
             "calc_single_term_variance is still missing after second-pass source-dump loading."
         )
 
+    # Repair the expiration clock after all source-dump passes. The notebook
+    # implementation accepts only the root and therefore hardcodes SPXW to 16:00.
+    # Production must use the actual XNYS close on the expiration date so that
+    # early-close SPXW expirations settle at 13:00 rather than 16:00.
+    ns["settlement_minutes_after_midnight_et"] = production_settlement_minutes_after_midnight_et
+    ns["minutes_to_expiry_vix_method"] = production_minutes_to_expiry_vix_method
+    rows.append({
+        "source": "production_calendar_override",
+        "source_path": str(Path(__file__).resolve()),
+        "block_index": None,
+        "name": "settlement_minutes_after_midnight_et/minutes_to_expiry_vix_method",
+        "status": "loaded",
+        "line_count": None,
+        "new_globals": "expiration-aware SPXW settlement clock",
+    })
+
     loaded_df = pd.DataFrame(rows)
     warnings_df = pd.DataFrame(warnings)
 
@@ -1586,17 +1688,39 @@ def call_calculation_function(ns: Dict[str, Any], trade_date_ts: pd.Timestamp, c
 
 
 def upsert_rows(existing: pd.DataFrame, new_rows: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """Replace matching date x tenor keys explicitly, then append the new rows.
+
+    Refresh precedence must not depend on nullable timestamps or sort behavior. Every
+    key present in new_rows removes the existing canonical key before concatenation.
+    """
     if new_rows.empty:
         return existing.copy()
-    combined = pd.concat([existing, new_rows], ignore_index=True, sort=False)
-    combined["trade_date"] = parse_trade_date_series(combined["trade_date"])
-    combined["tenor"] = pd.to_numeric(combined["tenor"], errors="raise").astype(int)
-    combined["target_days"] = pd.to_numeric(combined.get("target_days", combined["tenor"]), errors="coerce").fillna(combined["tenor"]).astype(int)
-    combined = combined.sort_values(["trade_date", "tenor", "run_timestamp" if "run_timestamp" in combined.columns else "trade_date"]).reset_index(drop=True)
-    # Last row wins for explicit refresh/upsert.
-    combined = combined.drop_duplicates(["trade_date", "tenor"], keep="last")
-    combined = combined.sort_values(["trade_date", "tenor"]).reset_index(drop=True)
-    return combined
+
+    old = existing.copy()
+    new = new_rows.copy()
+    for frame in (old, new):
+        frame["trade_date"] = parse_trade_date_series(frame["trade_date"])
+        frame["tenor"] = pd.to_numeric(frame["tenor"], errors="raise").astype(int)
+        frame["target_days"] = pd.to_numeric(
+            frame.get("target_days", frame["tenor"]), errors="coerce"
+        ).fillna(frame["tenor"]).astype(int)
+
+    if new.duplicated(["trade_date", "tenor"]).any():
+        duplicate_keys = new.loc[
+            new.duplicated(["trade_date", "tenor"], keep=False), ["trade_date", "tenor"]
+        ].drop_duplicates()
+        raise RuntimeError(
+            "New implied-variance rows are duplicated by date x tenor: "
+            f"{duplicate_keys.head(20).to_dict(orient='records')}"
+        )
+
+    replacement_keys = pd.MultiIndex.from_frame(new[["trade_date", "tenor"]])
+    old_keys = pd.MultiIndex.from_frame(old[["trade_date", "tenor"]])
+    retained_old = old.loc[~old_keys.isin(replacement_keys)].copy()
+    combined = pd.concat([retained_old, new], ignore_index=True, sort=False)
+    if combined.duplicated(["trade_date", "tenor"]).any():
+        raise RuntimeError("Explicit implied-variance upsert left duplicate date x tenor keys.")
+    return combined.sort_values(["trade_date", "tenor"]).reset_index(drop=True)
 
 
 def validate_surface(df: pd.DataFrame, cfg: Config, target_dates: Optional[Sequence[pd.Timestamp]] = None) -> pd.DataFrame:
@@ -1796,6 +1920,15 @@ def run(cfg: Config) -> int:
             row_base = {"trade_date": date_str(d), "status": "started", "rows": None, "error": None}
             try:
                 calc_df, detail = call_calculation_function(ns, d, cfg)
+                rate_record = ns["get_interest_rate_record_for_date_v3"](
+                    symbol="SOFR", trade_date=d
+                )
+                calc_df = calc_df.copy()
+                calc_df["rate_observation_date"] = rate_record["rate_observation_date"]
+                calc_df["rate_selection_rule"] = rate_record["rate_selection_rule"]
+                calc_df["rate_decimal"] = rate_record["rate_decimal"]
+                # Override any legacy same-date or source-generated rate metadata.
+                calc_df["rate_pct"] = rate_record["rate_pct"]
                 if len(calc_df) != len(cfg.target_tenors):
                     raise RuntimeError(f"Expected {len(cfg.target_tenors)} rows for {date_str(d)}, got {len(calc_df)}")
                 new_frames.append(calc_df)
