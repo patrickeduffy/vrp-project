@@ -551,7 +551,7 @@ def pipeline(config: PipelineConfig) -> dict[str, Any]:
             ]
             if config.force_recalculate:
                 rsi_cmd.append("--force-full-refresh")
-            step_rows.append(run_command(label="03_wilder_rsi", command=rsi_cmd, log_dir=log_dir, progress_pct=36))
+            step_rows.append(run_command(label="03_wilder_rsi", command=rsi_cmd, log_dir=log_dir, progress_pct=39))
 
             corsi_script = resolve_script(config.project_root, scripts["corsi_source"])
             corsi_cmd = [
@@ -561,7 +561,7 @@ def pipeline(config: PipelineConfig) -> dict[str, Any]:
             ]
             if config.force_recalculate:
                 corsi_cmd.append("--force-refresh-theta")
-            step_rows.append(run_command(label="04_corsi_source", command=corsi_cmd, log_dir=log_dir, progress_pct=48))
+            step_rows.append(run_command(label="04_corsi_source", command=corsi_cmd, log_dir=log_dir, progress_pct=50))
 
             feature_path = glob_latest(config.project_root, runtime["discovery"].get("feature_panel", []))
             feature_latest = file_max_date(feature_path) if feature_path else None

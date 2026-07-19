@@ -22,7 +22,11 @@ from vrp_hybrid_v2_common import (
     write_parquet_atomic,
 )
 
-FORMULA_VERSION = "wilder_rsi14_spy_close_v2_long_warmup"
+FORMULA_VERSION = "wilder_rsi14_spy_close_v3_clean_session_rebuild"
+LEGACY_SEED_VERSIONS = {
+    "wilder_rsi14_spy_close_v2_long_warmup",
+    FORMULA_VERSION,
+}
 DEFAULT_OUTPUT_START = "20180102"
 DEFAULT_CANONICAL_PRICE_REL = Path("data/processed/market_data/spy_eod_prices_v1.parquet")
 DEFAULT_OUTPUT_REL = Path("data/processed/market_data/spy_wilder_rsi14_history_v1.parquet")
@@ -141,7 +145,7 @@ def _duplicate_row_is_valid(row: pd.Series) -> bool:
         and float(numeric["wilder_avg_gain_14"]) >= 0
         and float(numeric["wilder_avg_loss_14"]) >= 0
         and 0 <= float(numeric["spy_wilder_rsi14"]) <= 100
-        and str(row["rsi_formula_version"]) == FORMULA_VERSION
+        and str(row["rsi_formula_version"]) in LEGACY_SEED_VERSIONS
     )
 
 
@@ -190,7 +194,7 @@ def collapse_semantic_duplicate_dates(out: pd.DataFrame) -> tuple[pd.DataFrame, 
             ).all():
                 conflicts.append(column)
         versions = sorted(valid["rsi_formula_version"].dropna().astype(str).unique())
-        if versions != [FORMULA_VERSION]:
+        if len(versions) != 1 or not set(versions).issubset(LEGACY_SEED_VERSIONS):
             conflicts.append("rsi_formula_version")
 
         if conflicts:
@@ -255,9 +259,10 @@ def load_accepted_state(path: Path, end_date: pd.Timestamp) -> tuple[pd.DataFram
     if out.empty:
         raise RuntimeError("Accepted Wilder RSI history is empty.")
     observed = sorted(out["rsi_formula_version"].dropna().astype(str).unique())
-    if observed != [FORMULA_VERSION]:
+    if not observed or not set(observed).issubset(LEGACY_SEED_VERSIONS):
         raise RuntimeError(
-            f"Accepted Wilder RSI formula version mismatch: observed={observed}, required={[FORMULA_VERSION]}"
+            "Accepted Wilder RSI formula version cannot seed the clean-session rebuild: "
+            f"observed={observed}, allowed={sorted(LEGACY_SEED_VERSIONS)}"
         )
     return out, duplicate_audit, input_rows
 
@@ -291,14 +296,25 @@ def find_recalc_start(
     existing_idx = existing.set_index("trade_date")
     reasons: list[tuple[pd.Timestamp, str]] = []
 
-    if force_full_refresh:
+    observed_versions = set(existing["rsi_formula_version"].dropna().astype(str).unique())
+    migrate_formula = observed_versions != {FORMULA_VERSION}
+    if force_full_refresh or migrate_formula:
         valid = existing.loc[valid_state_mask(existing)].copy()
         valid = valid.loc[valid["trade_date"].isin(canonical_window["trade_date"])]
         if valid.empty:
-            raise RuntimeError("Force refresh requested, but no valid accepted RSI seed row exists.")
+            raise RuntimeError("Full RSI rebuild requested, but no valid accepted seed row exists.")
         seed_date = valid["trade_date"].min()
         later = canonical_window.loc[canonical_window["trade_date"].gt(seed_date), "trade_date"]
-        return (later.min() if len(later) else None), [f"force_full_refresh_after_seed={seed_date.date()}"]
+        reasons = []
+        if force_full_refresh:
+            reasons.append(f"force_full_refresh_after_seed={seed_date.date()}")
+        if migrate_formula:
+            reasons.append(
+                "formula_migration="
+                + ",".join(sorted(observed_versions))
+                + f"->{FORMULA_VERSION}"
+            )
+        return (later.min() if len(later) else None), reasons
 
     for row in canonical_window.itertuples(index=False):
         date = pd.Timestamp(row.trade_date)
@@ -359,14 +375,21 @@ def rebuild_from_seed(
     seed = valid.sort_values("trade_date").iloc[-1]
     seed_date = pd.Timestamp(seed["trade_date"])
 
-    preserved_dates = canonical_window.loc[canonical_window["trade_date"].le(seed_date), ["trade_date"]]
-    preserved = preserved_dates.merge(existing, on="trade_date", how="left", validate="one_to_one")
-    if preserved[[
-        "spy_close", "wilder_avg_gain_14", "wilder_avg_loss_14", "spy_wilder_rsi14", "rsi_formula_version"
-    ]].isna().any().any():
-        raise RuntimeError("Accepted RSI history is incomplete before the selected seed date.")
+    # Preserve only the earliest valid long-warmup seed. Every later observation is
+    # rebuilt from the clean canonical XNYS-session SPY close sequence.
+    preserved = pd.DataFrame([seed]).copy()
+    preserved["rsi_formula_version"] = FORMULA_VERSION
+    preserved["source_name"] = (
+        "canonical_spy_eod_prices_v1; clean-session recursive rebuild from accepted initial seed"
+    )
+    canonical_seed_close = float(
+        canonical_window.loc[canonical_window["trade_date"].eq(seed_date), "spy_close"].iloc[0]
+    )
+    if abs(float(seed["spy_close"]) - canonical_seed_close) > CLOSE_TOLERANCE:
+        raise RuntimeError("The accepted initial RSI seed close does not match canonical SPY.")
+    preserved["spy_close"] = canonical_seed_close
 
-    prev_close = float(seed["spy_close"])
+    prev_close = float(preserved.iloc[0]["spy_close"])
     prev_avg_gain = float(seed["wilder_avg_gain_14"])
     prev_avg_loss = float(seed["wilder_avg_loss_14"])
     new_rows: list[dict[str, Any]] = []
@@ -389,7 +412,7 @@ def rebuild_from_seed(
             "wilder_avg_loss_14": avg_loss,
             "spy_wilder_rsi14": rsi,
             "rsi_formula_version": FORMULA_VERSION,
-            "source_name": "canonical_spy_eod_prices_v1; recursive extension from accepted long-warmup state",
+            "source_name": "canonical_spy_eod_prices_v1; clean-session recursive rebuild from accepted initial seed",
         })
         prev_close = close
         prev_avg_gain = avg_gain
@@ -399,11 +422,57 @@ def rebuild_from_seed(
     output = pd.concat([preserved, recalculated], ignore_index=True)
     output = canonical_window[["trade_date"]].merge(output, on="trade_date", how="left", validate="one_to_one")
     return output, {
-        "mode": "recursive_extension_from_accepted_state",
+        "mode": "clean_session_recursive_rebuild_from_initial_seed",
         "seed_date": str(seed_date.date()),
         "recalc_start": str(recalc_start.date()),
         "recalculated_rows": int(len(recalculated)),
         "preserved_rows": int(len(preserved)),
+    }
+
+
+def recurrence_diagnostics(output: pd.DataFrame) -> dict[str, Any]:
+    """Independently verify close changes, Wilder state recursion, and RSI values."""
+    work = output.sort_values("trade_date").reset_index(drop=True).copy()
+    if len(work) < 2:
+        return {
+            "checked_rows": 0,
+            "max_change_abs_diff": 0.0,
+            "max_avg_gain_abs_diff": 0.0,
+            "max_avg_loss_abs_diff": 0.0,
+            "max_rsi_abs_diff": 0.0,
+        }
+
+    change_expected = work["spy_close"].diff()
+    gain = change_expected.clip(lower=0.0)
+    loss = (-change_expected).clip(lower=0.0)
+    gain_expected = pd.Series(np.nan, index=work.index, dtype=float)
+    loss_expected = pd.Series(np.nan, index=work.index, dtype=float)
+    rsi_expected = pd.Series(np.nan, index=work.index, dtype=float)
+    gain_expected.iloc[0] = float(work.loc[0, "wilder_avg_gain_14"])
+    loss_expected.iloc[0] = float(work.loc[0, "wilder_avg_loss_14"])
+    rsi_expected.iloc[0] = float(work.loc[0, "spy_wilder_rsi14"])
+    for idx in range(1, len(work)):
+        gain_expected.iloc[idx] = (
+            gain_expected.iloc[idx - 1] * (PERIOD - 1) + float(gain.iloc[idx])
+        ) / PERIOD
+        loss_expected.iloc[idx] = (
+            loss_expected.iloc[idx - 1] * (PERIOD - 1) + float(loss.iloc[idx])
+        ) / PERIOD
+        rsi_expected.iloc[idx] = compute_rsi(
+            float(gain_expected.iloc[idx]), float(loss_expected.iloc[idx])
+        )
+
+    def max_diff(a: pd.Series, b: pd.Series) -> float:
+        values = (pd.to_numeric(a, errors="coerce") - pd.to_numeric(b, errors="coerce")).abs()
+        values = values.iloc[1:].dropna()
+        return float(values.max()) if len(values) else 0.0
+
+    return {
+        "checked_rows": int(len(work) - 1),
+        "max_change_abs_diff": max_diff(work["spy_change"], change_expected),
+        "max_avg_gain_abs_diff": max_diff(work["wilder_avg_gain_14"], gain_expected),
+        "max_avg_loss_abs_diff": max_diff(work["wilder_avg_loss_14"], loss_expected),
+        "max_rsi_abs_diff": max_diff(work["spy_wilder_rsi14"], rsi_expected),
     }
 
 
@@ -415,6 +484,8 @@ def validate_output(
     numeric_cols = [
         "spy_close", "spy_change", "wilder_avg_gain_14", "wilder_avg_loss_14", "spy_wilder_rsi14"
     ]
+    recurrence = recurrence_diagnostics(output)
+    recurrence_tolerance = 1e-10
     checks = [
         {
             "check": "output_dates_match_canonical",
@@ -463,6 +534,26 @@ def validate_output(
             "detail": f"absolute_tolerance={CLOSE_TOLERANCE}",
         },
         {
+            "check": "spy_change_recurrence_exact",
+            "status": "PASS" if recurrence["max_change_abs_diff"] <= recurrence_tolerance else "FAIL",
+            "detail": f"max_abs_diff={recurrence['max_change_abs_diff']}; tolerance={recurrence_tolerance}",
+        },
+        {
+            "check": "wilder_avg_gain_recurrence_exact",
+            "status": "PASS" if recurrence["max_avg_gain_abs_diff"] <= recurrence_tolerance else "FAIL",
+            "detail": f"max_abs_diff={recurrence['max_avg_gain_abs_diff']}; tolerance={recurrence_tolerance}",
+        },
+        {
+            "check": "wilder_avg_loss_recurrence_exact",
+            "status": "PASS" if recurrence["max_avg_loss_abs_diff"] <= recurrence_tolerance else "FAIL",
+            "detail": f"max_abs_diff={recurrence['max_avg_loss_abs_diff']}; tolerance={recurrence_tolerance}",
+        },
+        {
+            "check": "wilder_rsi_recurrence_exact",
+            "status": "PASS" if recurrence["max_rsi_abs_diff"] <= recurrence_tolerance else "FAIL",
+            "detail": f"max_abs_diff={recurrence['max_rsi_abs_diff']}; tolerance={recurrence_tolerance}",
+        },
+        {
             "check": "latest_rsi_finite",
             "status": "PASS" if np.isfinite(output.loc[output["trade_date"].eq(end_date), "spy_wilder_rsi14"]).all() else "FAIL",
             "detail": str(output.loc[output["trade_date"].eq(end_date), "spy_wilder_rsi14"].tolist()),
@@ -485,7 +576,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Accepted RSI state path:  {cfg.output_path}")
     print(f"Formula version:          {FORMULA_VERSION}")
     print(f"Force refresh:            {cfg.force_full_refresh}")
-    print("Historical stock API:     DISABLED — accepted long-warmup state is authoritative")
+    print("Historical stock API:     DISABLED - clean canonical-session rebuild uses accepted initial seed")
 
     canonical = load_canonical_prices(cfg.canonical_price_path, cfg.end_date)
     canonical_window = canonical.loc[canonical["trade_date"].ge(cfg.output_start)].copy().reset_index(drop=True)
@@ -559,7 +650,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "recalc_start": update_meta["recalc_start"],
         "recalculated_rows": int(update_meta["recalculated_rows"]),
         "historical_stock_api_called": False,
-        "subscription_requirement": "No historical ThetaData stock subscription required; accepted recursive state is authoritative.",
+        "subscription_requirement": "No historical ThetaData stock subscription required; clean canonical-session rebuild uses the accepted initial seed.",
         "output": str(cfg.output_path),
         "backup": str(backup) if backup else None,
         "validation": str(validation_path),

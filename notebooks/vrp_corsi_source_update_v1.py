@@ -24,6 +24,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    from vrp_hybrid_v2_common import xnys_sessions
+except ImportError:  # importlib-based tests load from the project root
+    from notebooks.vrp_hybrid_v2_common import xnys_sessions
+
 
 SELECTED_CELL_INDICES = [2, 4, 6, 8, 10, 12]
 
@@ -111,6 +116,100 @@ def source_text(cell: dict) -> str:
     return "".join(cell.get("source", []))
 
 
+
+
+def load_canonical_spy_eod(project_root: Path, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
+    """Load the sole baseline-return source for the repaired forecast history.
+
+    The available, sustainable production source is the canonical SPY EOD file.
+    Returns are computed from one continuous SPY close series before the requested
+    window is filtered. SPX/generic-close fallback is prohibited.
+    """
+    path = (
+        project_root
+        / "data"
+        / "processed"
+        / "market_data"
+        / "spy_eod_prices_v1.parquet"
+    )
+    if not path.exists():
+        raise FileNotFoundError(
+            "Canonical SPY EOD source is required before the Corsi source update: "
+            f"{path}"
+        )
+
+    frame = pd.read_parquet(path)
+    required = {"trade_date", "spy_close"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"Canonical SPY EOD source missing columns {missing}: {path}")
+
+    out = frame[["trade_date", "spy_close"]].copy()
+    out["date"] = parse_dates(out["trade_date"])
+    out["spy_close"] = pd.to_numeric(out["spy_close"], errors="coerce")
+
+    duplicate_rows = int(out.duplicated("date", keep=False).sum())
+    invalid_rows = int(
+        (
+            out["date"].isna()
+            | out["spy_close"].isna()
+            | ~np.isfinite(out["spy_close"])
+            | out["spy_close"].le(0)
+        ).sum()
+    )
+    if duplicate_rows:
+        raise RuntimeError(
+            f"Canonical SPY EOD source has duplicate dates: rows={duplicate_rows}"
+        )
+    if invalid_rows:
+        raise RuntimeError(
+            f"Canonical SPY EOD source has invalid dates/closes: rows={invalid_rows}"
+        )
+
+    out = out.sort_values("date").reset_index(drop=True)
+    out["spy_log_return"] = np.log(out["spy_close"] / out["spy_close"].shift(1))
+    scale_breaks = out["spy_log_return"].abs().gt(0.25)
+    if bool(scale_breaks.any()):
+        bad = out.loc[scale_breaks, ["date", "spy_close", "spy_log_return"]].head(20)
+        raise RuntimeError(
+            "Canonical SPY EOD source contains an unexplained close-scale break; "
+            f"sample=\n{bad.to_string(index=False)}"
+        )
+
+    expected_sessions = xnys_sessions(start_ts, end_ts)
+    if len(expected_sessions) == 0:
+        raise RuntimeError(
+            "Requested Corsi window contains no XNYS sessions: "
+            f"requested={start_ts.date()}..{end_ts.date()}"
+        )
+
+    actual_dates = pd.DatetimeIndex(out["date"]).normalize().unique()
+    missing_sessions = expected_sessions.difference(actual_dates)
+    if len(missing_sessions):
+        raise RuntimeError(
+            "Canonical SPY EOD source is missing required XNYS sessions for the Corsi window: "
+            f"count={len(missing_sessions)}, "
+            f"examples={[str(x.date()) for x in missing_sessions[:20]]}"
+        )
+
+    window = out.loc[out["date"].isin(expected_sessions)].copy()
+    if window.empty:
+        raise RuntimeError(
+            "Canonical SPY EOD source produced no rows for the requested XNYS window: "
+            f"requested={start_ts.date()}..{end_ts.date()}"
+        )
+
+    window["return_source_underlying"] = "SPY"
+    window["return_source_version"] = "canonical_spy_eod_prices_v1"
+    window["spx_source"] = "SPY_COMPATIBILITY_ALIAS"
+    return window[[
+        "date",
+        "spy_close",
+        "spy_log_return",
+        "return_source_underlying",
+        "return_source_version",
+        "spx_source",
+    ]]
 
 def make_control_date_panel(project_root: Path, start_date: str, end_date: str, run_ts: str) -> Path:
     """
@@ -215,6 +314,35 @@ def make_control_date_panel(project_root: Path, start_date: str, end_date: str, 
         .reset_index(drop=True)
     )
 
+    # Enforce one baseline-return source for the complete history. Any inherited
+    # SPX, SPY, or generic close/return fields are replaced by canonical SPY.
+    spy_daily = load_canonical_spy_eod(project_root, start_ts, end_ts)
+    source_cols = (
+        "spx_close", "spx_log_return", "spx_source",
+        "spy_close", "spy_log_return",
+        "return_source_underlying", "return_source_version",
+    )
+    panel = panel.drop(columns=[c for c in source_cols if c in panel.columns])
+    panel = panel.merge(spy_daily, on="date", how="left", validate="many_to_one")
+
+    missing_spy_dates = (
+        panel.loc[panel["spy_close"].isna(), "date"]
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+    )
+    if len(missing_spy_dates):
+        raise RuntimeError(
+            "Canonical SPY EOD merge left missing forecast-source dates: "
+            f"count={len(missing_spy_dates)}, "
+            f"examples={[str(x.date()) for x in missing_spy_dates.head(20)]}"
+        )
+
+    # The old notebook contract uses spx_* names. Keep explicit compatibility
+    # aliases while recording that the economic source is SPY.
+    panel["spx_close"] = panel["spy_close"]
+    panel["spx_log_return"] = panel["spy_log_return"]
+
     required_pairs = pd.MultiIndex.from_product(
         [
             pd.to_datetime(panel["date"]).drop_duplicates().sort_values(),
@@ -237,6 +365,8 @@ def make_control_date_panel(project_root: Path, start_date: str, end_date: str, 
     print("Control panel latest-date rows:", len(latest_rows))
     print("Control panel latest-date tenors:", sorted(latest_rows["tenor"].dropna().astype(int).unique().tolist()))
     print("Control panel has implied_variance:", "implied_variance" in panel.columns)
+    print("Control panel SPX source:", sorted(panel["spx_source"].dropna().unique().tolist()))
+    print("Control panel latest SPY close:", float(latest_rows["spy_close"].iloc[-1]) if len(latest_rows) else None)
 
     if latest_rows.empty:
         raise RuntimeError(f"Control panel has no rows for requested end date {end_date}.")
@@ -317,8 +447,11 @@ def summarize_table(path: Path, target_date: pd.Timestamp) -> dict:
         "min_date": None,
         "max_date": None,
         "has_target_date": False,
+        "has_spy_log_return": False,
+        "has_spy_close": False,
         "has_spx_log_return": False,
         "has_spx_close": False,
+        "has_return_source_underlying": False,
         "has_corsi_model_usable": False,
         "has_corsi_quality_status": False,
         "error": "",
@@ -329,8 +462,11 @@ def summarize_table(path: Path, target_date: pd.Timestamp) -> dict:
         row["cols"] = len(df.columns)
 
         cols = set(map(str, df.columns))
+        row["has_spy_log_return"] = "spy_log_return" in cols
+        row["has_spy_close"] = "spy_close" in cols
         row["has_spx_log_return"] = "spx_log_return" in cols
         row["has_spx_close"] = "spx_close" in cols
+        row["has_return_source_underlying"] = "return_source_underlying" in cols
         row["has_corsi_model_usable"] = "corsi_model_usable" in cols
         row["has_corsi_quality_status"] = "corsi_quality_status" in cols
 
@@ -373,6 +509,8 @@ def compare_old_new_model_panel(old_path: Path, new_path: Path, out_dir: Path, r
 
     compare_cols = [
         c for c in [
+            "spy_close",
+            "spy_log_return",
             "spx_close",
             "spx_log_return",
             "spy_total_return",
@@ -404,6 +542,98 @@ def compare_old_new_model_panel(old_path: Path, new_path: Path, out_dir: Path, r
     return summary
 
 
+
+
+def enforce_model_panel_spy_contract(model_path: Path, control_path: Path) -> dict:
+    """Persist the canonical SPY return contract on the final Corsi model panel.
+
+    The legacy notebook carries the economic series through ``spx_*`` compatibility
+    aliases but drops the explicit ``spy_*`` fields and provenance before writing its
+    final model panel.  Reattach those fields from the wrapper control panel, overwrite
+    the legacy aliases with the same canonical values, and fail on any ambiguity.
+    """
+    model = pd.read_parquet(model_path)
+    control = pd.read_parquet(control_path)
+
+    if "date" in model.columns:
+        model_dates = parse_dates(model["date"])
+    elif "trade_date" in model.columns:
+        model_dates = parse_dates(model["trade_date"])
+    else:
+        raise ValueError(f"Model panel missing date/trade_date: {model_path}")
+
+    if "date" in control.columns:
+        control_dates = parse_dates(control["date"])
+    elif "trade_date" in control.columns:
+        control_dates = parse_dates(control["trade_date"])
+    else:
+        raise ValueError(f"Control panel missing date/trade_date: {control_path}")
+
+    required = ["spy_close", "spy_log_return", "return_source_underlying", "return_source_version"]
+    missing = [c for c in required if c not in control.columns]
+    if missing:
+        raise ValueError(f"Control panel missing canonical SPY contract fields {missing}: {control_path}")
+
+    daily = control[required].copy()
+    daily.insert(0, "_contract_date", control_dates)
+    if daily["_contract_date"].isna().any():
+        raise RuntimeError("Control panel contains unparseable dates while enforcing SPY contract")
+
+    for col in required:
+        grouped = daily.groupby("_contract_date", dropna=False)[col].nunique(dropna=False)
+        bad = grouped[grouped.gt(1)]
+        if len(bad):
+            raise RuntimeError(
+                f"Control panel canonical SPY field is not daily-constant: column={col}; "
+                f"dates={[str(x.date()) for x in bad.index[:20]]}"
+            )
+
+    daily = daily.drop_duplicates("_contract_date", keep="first")
+    daily["spy_close"] = pd.to_numeric(daily["spy_close"], errors="coerce")
+    daily["spy_log_return"] = pd.to_numeric(daily["spy_log_return"], errors="coerce")
+    invalid_close = daily["spy_close"].isna() | ~np.isfinite(daily["spy_close"]) | daily["spy_close"].le(0)
+    if bool(invalid_close.any()):
+        raise RuntimeError("Control panel contains invalid canonical SPY closes")
+
+    out = model.copy()
+    out["_contract_date"] = model_dates
+    replace_cols = [*required, "spx_close", "spx_log_return", "spx_source"]
+    out = out.drop(columns=[c for c in replace_cols if c in out.columns])
+    out = out.merge(daily, on="_contract_date", how="left", validate="many_to_one", sort=False)
+
+    missing_close = out["spy_close"].isna()
+    missing_return = out["spy_log_return"].isna()
+    if bool(missing_close.any()) or bool(missing_return.any()):
+        examples = out.loc[missing_close | missing_return, "_contract_date"].dropna().drop_duplicates().head(20)
+        raise RuntimeError(
+            "Canonical SPY contract merge left missing model-panel rows: "
+            f"missing_close={int(missing_close.sum())}; missing_return={int(missing_return.sum())}; "
+            f"dates={[str(x.date()) for x in examples]}"
+        )
+
+    observed = sorted(out["return_source_underlying"].dropna().astype(str).unique().tolist())
+    if observed != ["SPY"]:
+        raise RuntimeError(f"Unexpected return-source provenance after merge: {observed}")
+
+    out["spx_close"] = out["spy_close"]
+    out["spx_log_return"] = out["spy_log_return"]
+    out["spx_source"] = "SPY_COMPATIBILITY_ALIAS"
+    out = out.drop(columns=["_contract_date"])
+
+    temp_path = model_path.with_name(model_path.stem + ".tmp.parquet")
+    out.to_parquet(temp_path, index=False)
+    temp_path.replace(model_path)
+
+    return {
+        "rows": int(len(out)),
+        "first_date": model_dates.min().date().isoformat(),
+        "last_date": model_dates.max().date().isoformat(),
+        "spy_close_nonnull": int(out["spy_close"].notna().sum()),
+        "spy_log_return_nonnull": int(out["spy_log_return"].notna().sum()),
+        "return_source_underlying": observed,
+        "max_alias_close_diff": float((out["spx_close"] - out["spy_close"]).abs().max()),
+        "max_alias_return_diff": float((out["spx_log_return"] - out["spy_log_return"]).abs().max()),
+    }
 
 def override_path_assignment(src: str, name: str, path_text: str) -> str:
     """
@@ -530,6 +760,15 @@ def main() -> None:
     if missing:
         raise RuntimeError(f"Missing expected artifacts for RUN_TIMESTAMP={run_ts}: {missing}")
 
+    model_contract = enforce_model_panel_spy_contract(
+        new_paths["corsi_model_feature_panel_v1"], control_dates
+    )
+    model_contract_path = audit_update_dir / f"corsi_source_update_spy_contract_{run_ts}.json"
+    model_contract_path.write_text(json.dumps(model_contract, indent=2), encoding="utf-8")
+    section("Canonical SPY contract persisted on model panel")
+    print(json.dumps(model_contract, indent=2))
+    print("Saved:", model_contract_path)
+
     summary = pd.DataFrame([
         {"artifact": stem, **summarize_table(path, target_date)}
         for stem, path in new_paths.items()
@@ -557,7 +796,13 @@ def main() -> None:
         f"target={target_date.date()}; max={model_dates.max().date()}",
     )
 
-    check("model_feature_panel_has_spx_log_return", "spx_log_return" in model_df.columns, "required by locked Cell 4 source")
+    check("model_feature_panel_has_spy_log_return", "spy_log_return" in model_df.columns, "canonical SPY return source")
+    check("model_feature_panel_has_spy_close", "spy_close" in model_df.columns, "canonical SPY close source")
+    check("model_feature_panel_has_return_source_underlying", "return_source_underlying" in model_df.columns, "source provenance required")
+    if "return_source_underlying" in model_df.columns:
+        observed_sources = sorted(model_df["return_source_underlying"].dropna().astype(str).unique().tolist())
+        check("model_feature_panel_return_source_is_spy", observed_sources == ["SPY"], f"observed={observed_sources}")
+    check("model_feature_panel_has_spx_log_return_legacy_alias", "spx_log_return" in model_df.columns, "old notebook compatibility alias")
     check("model_feature_panel_has_spx_close", "spx_close" in model_df.columns, "required by locked Cell 4 source")
 
     tenor_col = "target_days" if "target_days" in model_df.columns else ("tenor" if "tenor" in model_df.columns else None)
@@ -594,6 +839,7 @@ def main() -> None:
         "new_paths": {k: str(v) for k, v in new_paths.items()},
         "summary": str(summary_path),
         "validation": str(validation_path),
+        "model_spy_contract": str(model_contract_path),
     }
     manifest_path = audit_update_dir / f"corsi_source_update_manifest_{run_ts}.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

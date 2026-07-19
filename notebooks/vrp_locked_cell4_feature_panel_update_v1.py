@@ -57,6 +57,8 @@ AUX_FEATURES = [
 ]
 
 COMPARE_COLS = [
+    "spy_close_for_features",
+    "spy_log_return",
     "spx_close_for_features",
     "spx_log_return",
     *REQUIRED_LOCKED_FEATURES,
@@ -151,84 +153,81 @@ def assert_daily_constant(df: pd.DataFrame, col: str, tol: float = 1e-12) -> Non
 
 
 def build_daily_locked_features(source: pd.DataFrame) -> pd.DataFrame:
+    """Build all return-dependent features from canonical SPY only.
+
+    ``spy_close`` and ``spy_log_return`` must come from the canonical SPY EOD
+    source. Returns are checked against close-derived returns. No SPX, generic
+    close, or scale-break fallback is permitted. Legacy spx_* output aliases are
+    retained only to preserve downstream schema compatibility.
+    """
     src = source.copy()
+    required = {"date", "spy_close", "spy_log_return"}
+    missing = sorted(required - set(src.columns))
+    if missing:
+        raise ValueError(
+            f"Locked Cell 4 source missing canonical SPY fields {missing}. "
+            "SPX/generic-close fallback is prohibited."
+        )
 
-    close_candidates = [
-        "spx_close",
-        "spx_close_for_features",
-        "eod_close_sanitized",
-        "eod_close",
-        "spy_close",
-        "close",
-        "last_close",
-    ]
-    return_candidates = [
-        "spx_log_return",
-        "spy_total_return",
-        "spy_log_return",
-        "log_return",
-    ]
+    assert_daily_constant(src, "spy_close")
+    assert_daily_constant(src, "spy_log_return")
 
-    close_cols = [c for c in close_candidates if c in src.columns]
-    return_cols = [c for c in return_candidates if c in src.columns]
-
-    if not close_cols and not return_cols:
-        raise ValueError("Source must contain a usable close or return column.")
-
-    for c in close_cols:
-        assert_daily_constant(src, c)
-    for c in return_cols:
-        assert_daily_constant(src, c)
-
-    agg = {"date": sorted(src["date"].dropna().unique())}
-    daily = pd.DataFrame(agg).sort_values("date").reset_index(drop=True)
-
-    if close_cols:
-        close_frame = src[["date", *close_cols]].copy()
-        for c in close_cols:
-            close_frame[c] = pd.to_numeric(close_frame[c], errors="coerce")
-        close_frame["_feature_close_candidate"] = close_frame[close_cols].bfill(axis=1).iloc[:, 0]
-        close_by_date = close_frame.groupby("date")["_feature_close_candidate"].agg(first_nonnull)
-        daily["spx_close_for_features"] = daily["date"].map(close_by_date)
-    else:
-        daily["spx_close_for_features"] = np.nan
-
-    if return_cols:
-        ret_frame = src[["date", *return_cols]].copy()
-        for c in return_cols:
-            ret_frame[c] = pd.to_numeric(ret_frame[c], errors="coerce")
-        ret_frame["_feature_return_candidate"] = ret_frame[return_cols].bfill(axis=1).iloc[:, 0]
-        ret_by_date = ret_frame.groupby("date")["_feature_return_candidate"].agg(first_nonnull)
-        daily["spx_log_return_from_source"] = daily["date"].map(ret_by_date)
-    else:
-        daily["spx_log_return_from_source"] = np.nan
-
-    close_series = pd.to_numeric(daily["spx_close_for_features"], errors="coerce")
-    ret_from_close = np.log(close_series / close_series.shift(1))
-    ret_from_source = pd.to_numeric(daily["spx_log_return_from_source"], errors="coerce")
-
-    # Prefer locked Cell 4 close-derived returns, but guard against scale breaks
-    # when a newly appended source row has SPY-scale close while prior rows are SPX-scale.
-    use_source_return = ret_from_close.isna() | (
-        ret_from_source.notna() & ret_from_close.abs().gt(0.25)
+    close_frame = src[["date", "spy_close", "spy_log_return"]].copy()
+    close_frame["spy_close"] = pd.to_numeric(close_frame["spy_close"], errors="coerce")
+    close_frame["spy_log_return"] = pd.to_numeric(close_frame["spy_log_return"], errors="coerce")
+    daily = (
+        close_frame.groupby("date", as_index=False)
+        .agg({"spy_close": first_nonnull, "spy_log_return": first_nonnull})
+        .sort_values("date")
+        .reset_index(drop=True)
     )
-    daily["spx_log_return"] = ret_from_close.mask(use_source_return, ret_from_source)
+    daily = daily.rename(columns={"spy_close": "spy_close_for_features"})
 
-    scale_fallback_rows = daily.loc[
-        ret_from_close.notna() & ret_from_source.notna() & ret_from_close.abs().gt(0.25),
-        ["date", "spx_close_for_features", "spx_log_return_from_source"]
-    ].copy()
-    if len(scale_fallback_rows):
-        print("WARNING: used source return fallback for close-scale-break rows:")
-        print(scale_fallback_rows.tail(20).to_string(index=False))
+    invalid_close = (
+        daily["spy_close_for_features"].isna()
+        | ~np.isfinite(daily["spy_close_for_features"])
+        | daily["spy_close_for_features"].le(0)
+    )
+    if bool(invalid_close.any()):
+        bad = daily.loc[invalid_close, ["date", "spy_close_for_features"]].head(20)
+        raise RuntimeError(f"Canonical SPY feature closes invalid. Sample:\n{bad}")
 
-    print("Daily feature close candidate columns:", close_cols)
-    print("Daily feature return fallback columns:", return_cols)
+    close_series = pd.to_numeric(daily["spy_close_for_features"], errors="raise")
+    close_return = np.log(close_series / close_series.shift(1))
+    source_return = pd.to_numeric(daily["spy_log_return"], errors="coerce")
+    comparable = close_return.notna() & source_return.notna()
+    max_return_diff = float((close_return[comparable] - source_return[comparable]).abs().max()) if comparable.any() else 0.0
+    if not np.isfinite(max_return_diff) or max_return_diff > 1e-12:
+        raise RuntimeError(
+            "Canonical SPY return does not match log(spy_close/prior_spy_close): "
+            f"max_abs_diff={max_return_diff:.3e}"
+        )
+
+    daily["spy_log_return"] = close_return.where(close_return.notna(), source_return)
+    scale_break = daily["spy_log_return"].abs().gt(0.25)
+    if bool(scale_break.any()):
+        bad = daily.loc[scale_break, ["date", "spy_close_for_features", "spy_log_return"]].head(20)
+        raise RuntimeError(
+            "Canonical SPY feature source contains an unexplained close-scale break. "
+            f"Sample:\n{bad.to_string(index=False)}"
+        )
+
+    daily["feature_return_source"] = "SPY"
+    # Backward-compatible aliases required by existing forecast/report schemas.
+    daily["spx_close_for_features"] = daily["spy_close_for_features"]
+    daily["spx_log_return"] = daily["spy_log_return"]
+
+    print("Daily feature close source: canonical spy_close only")
+    print("Daily feature return source: log(spy_close / prior_spy_close)")
+    print("Legacy spx_* columns are SPY-backed compatibility aliases")
     print("Daily feature latest return inputs:")
-    latest_debug_cols = ["date", "spx_close_for_features", "spx_log_return_from_source", "spx_log_return"]
-    print(daily[latest_debug_cols].tail(10).to_string(index=False))
+    print(
+        daily[["date", "spy_close_for_features", "spy_log_return"]]
+        .tail(10)
+        .to_string(index=False)
+    )
 
-    r = pd.to_numeric(daily["spx_log_return"], errors="coerce")
+    r = pd.to_numeric(daily["spy_log_return"], errors="coerce")
     daily["ret_sq"] = r ** 2
     daily["downside_ret_sq"] = np.where(r < 0.0, r ** 2, 0.0)
     daily["abs_return_1d_raw"] = r.abs()
@@ -237,28 +236,22 @@ def build_daily_locked_features(source: pd.DataFrame) -> pd.DataFrame:
     for w in [5, 10, 21, 63]:
         rv = daily["ret_sq"].rolling(w, min_periods=w).mean() * 252.0
         downside_rv = daily["downside_ret_sq"].rolling(w, min_periods=w).mean() * 252.0
-
         daily[f"candidate_log_rv_{w}d"] = np.log(rv.clip(lower=EPS))
         daily[f"candidate_log_downside_rv_{w}d"] = np.log(pd.Series(downside_rv).clip(lower=EPS))
-
         ret_sq_sum = daily["ret_sq"].rolling(w, min_periods=w).sum()
         downside_sum = daily["downside_ret_sq"].rolling(w, min_periods=w).sum()
         daily[f"candidate_downside_share_{w}d"] = downside_sum / ret_sq_sum.replace(0.0, np.nan)
-
-        daily[f"candidate_negative_return_count_{w}d"] = (
-            daily["is_negative_return"].rolling(w, min_periods=w).sum()
-        )
+        daily[f"candidate_negative_return_count_{w}d"] = daily["is_negative_return"].rolling(w, min_periods=w).sum()
 
     for w in [3, 5, 10]:
-        daily[f"candidate_max_abs_return_{w}d"] = (
-            daily["abs_return_1d_raw"].rolling(w, min_periods=w).max()
-        )
-        daily[f"candidate_min_return_{w}d"] = (
-            daily["spx_log_return"].rolling(w, min_periods=w).min()
-        )
+        daily[f"candidate_max_abs_return_{w}d"] = daily["abs_return_1d_raw"].rolling(w, min_periods=w).max()
+        daily[f"candidate_min_return_{w}d"] = daily["spy_log_return"].rolling(w, min_periods=w).min()
 
     keep_cols = [
         "date",
+        "spy_close_for_features",
+        "spy_log_return",
+        "feature_return_source",
         "spx_close_for_features",
         "spx_log_return",
         *REQUIRED_LOCKED_FEATURES,
@@ -266,9 +259,74 @@ def build_daily_locked_features(source: pd.DataFrame) -> pd.DataFrame:
     ]
     return daily[[c for c in keep_cols if c in daily.columns]].copy()
 
+def materialize_target_contract_columns(source: pd.DataFrame) -> pd.DataFrame:
+    """Persist the authoritative forward-target contract in the locked feature panel.
+
+    The Corsi model panel stores the validated target as
+    ``log_forward_realized_variance_corsi``.  The locked forecast publisher
+    consumes the schema-compatible name ``target_log_variance``.  Rebuilding the
+    feature panel must therefore copy the validated Corsi target into that
+    contract column rather than creating an all-null placeholder from the old
+    template schema.
+    """
+    out = source.copy()
+
+    explicit = (
+        pd.to_numeric(out["target_log_variance"], errors="coerce")
+        if "target_log_variance" in out.columns
+        else pd.Series(np.nan, index=out.index, dtype=float)
+    )
+
+    if "log_forward_realized_variance_corsi" in out.columns:
+        derived = pd.to_numeric(out["log_forward_realized_variance_corsi"], errors="coerce")
+    elif "forward_realized_variance_corsi" in out.columns:
+        variance = pd.to_numeric(out["forward_realized_variance_corsi"], errors="coerce")
+        derived = np.log(variance.where(variance > 0.0))
+    else:
+        raise RuntimeError(
+            "Source Corsi model panel has no authoritative forward target: "
+            "expected log_forward_realized_variance_corsi or "
+            "forward_realized_variance_corsi."
+        )
+
+    overlap = explicit.notna() & derived.notna()
+    if bool(overlap.any()):
+        max_diff = float((explicit[overlap] - derived[overlap]).abs().max())
+        if not np.isfinite(max_diff) or max_diff > OVERLAP_TOL:
+            raise RuntimeError(
+                "Existing target_log_variance conflicts with the authoritative "
+                f"Corsi target: max_abs_diff={max_diff:.3e}."
+            )
+
+    out["target_log_variance"] = explicit.where(explicit.notna(), derived)
+
+    if "last_forward_rv_date" not in out.columns:
+        raise RuntimeError("Source Corsi model panel is missing last_forward_rv_date.")
+    out["last_forward_rv_date"] = parse_dates(out["last_forward_rv_date"])
+
+    if "forward_window_complete_corsi" in out.columns:
+        complete_raw = out["forward_window_complete_corsi"]
+        if pd.api.types.is_bool_dtype(complete_raw):
+            complete = complete_raw.fillna(False)
+        else:
+            complete = complete_raw.astype(str).str.strip().str.lower().isin({"true", "1", "yes"})
+        target_values = pd.to_numeric(out["target_log_variance"], errors="coerce")
+        bad = complete & (
+            ~np.isfinite(target_values)
+            | out["last_forward_rv_date"].isna()
+        )
+        if bool(bad.any()):
+            sample_cols = [c for c in ["date", "tenor", "target_log_variance", "last_forward_rv_date"] if c in out.columns]
+            raise RuntimeError(
+                "Complete Corsi target rows lost the locked target contract. Sample:\n"
+                + out.loc[bad, sample_cols].head(20).to_string(index=False)
+            )
+
+    return out
+
 
 def build_output_panel(source: pd.DataFrame, old_template: pd.DataFrame, daily_features: pd.DataFrame) -> pd.DataFrame:
-    base = source.copy()
+    base = materialize_target_contract_columns(source)
 
     # Keep target 9-tenor grid.
     base = base[base["tenor"].isin(EXPECTED_TENORS)].copy()
@@ -277,7 +335,7 @@ def build_output_panel(source: pd.DataFrame, old_template: pd.DataFrame, daily_f
     merged = base.merge(daily_features, on="date", how="left", suffixes=("", "_calc"))
 
     # Override these with locked Cell 4 calculations.
-    for col in ["spx_close_for_features", "spx_log_return", *REQUIRED_LOCKED_FEATURES, *AUX_FEATURES]:
+    for col in ["spy_close_for_features", "spy_log_return", "feature_return_source", "spx_close_for_features", "spx_log_return", *REQUIRED_LOCKED_FEATURES, *AUX_FEATURES]:
         calc_col = f"{col}_calc"
         if calc_col in merged.columns:
             merged[col] = merged[calc_col]
@@ -302,7 +360,7 @@ def build_output_panel(source: pd.DataFrame, old_template: pd.DataFrame, daily_f
     for c in REQUIRED_LOCKED_FEATURES:
         if c not in final_cols:
             final_cols.append(c)
-    for c in ["spx_close_for_features", "spx_log_return"]:
+    for c in ["spy_close_for_features", "spy_log_return", "feature_return_source", "spx_close_for_features", "spx_log_return"]:
         if c not in final_cols:
             final_cols.append(c)
 
@@ -312,37 +370,8 @@ def build_output_panel(source: pd.DataFrame, old_template: pd.DataFrame, daily_f
 
     out = merged[final_cols].copy()
 
-    # For all date/tenor rows already present in the original locked Cell 4 panel,
-    # preserve the old values exactly. The updater should only calculate appended rows.
-    old_overlay = normalize_date_tenor(old_template.copy())
-    old_overlay = old_overlay[old_overlay["tenor"].isin(EXPECTED_TENORS)].copy()
-    old_overlay["_key_trade_date"] = old_overlay["trade_date"].astype(int)
-    old_overlay["_key_tenor"] = old_overlay["tenor"].astype(int)
-    old_overlay["_old_locked_present"] = True
-
-    out["_key_trade_date"] = out["trade_date"].astype(int)
-    out["_key_tenor"] = out["tenor"].astype(int)
-
-    old_cols = [c for c in final_cols if c in old_overlay.columns]
-    overlay = out.merge(
-        old_overlay[["_key_trade_date", "_key_tenor", "_old_locked_present", *old_cols]],
-        on=["_key_trade_date", "_key_tenor"],
-        how="left",
-        suffixes=("", "_old_locked"),
-    )
-
-    old_mask = overlay["_old_locked_present"].fillna(False).astype(bool)
-    for c in old_cols:
-        old_c = f"{c}_old_locked"
-        if old_c in overlay.columns:
-            overlay.loc[old_mask, c] = overlay.loc[old_mask, old_c]
-
-    drop_cols = [
-        c for c in overlay.columns
-        if c.endswith("_old_locked") or c in ["_key_trade_date", "_key_tenor", "_old_locked_present"]
-    ]
-    out = overlay.drop(columns=drop_cols)
-
+    # Rebuild the complete historical panel from one SPY source. Old locked
+    # values are not overlaid because that would preserve the SPX/SPY source break.
     out = out[final_cols].copy()
     out = out.sort_values(["date", "tenor"]).reset_index(drop=True)
     return out
@@ -450,7 +479,7 @@ def main() -> None:
     print("Latest tenors:", latest_tenors)
 
     section("Latest feature rows")
-    show_cols = ["date", "trade_date", "tenor", "spx_log_return", *REQUIRED_LOCKED_FEATURES]
+    show_cols = ["date", "trade_date", "tenor", "spy_log_return", "feature_return_source", *REQUIRED_LOCKED_FEATURES]
     show_cols = [c for c in show_cols if c in out.columns]
     print(target_rows[show_cols].to_string(index=False))
 
@@ -477,7 +506,17 @@ def main() -> None:
     check("latest_required_features_non_null", len(target_missing_required) == 0, f"missing_latest={target_missing_required}")
 
     failed_overlap_cols = overlap.loc[overlap["status"].eq("FAIL"), "column"].tolist()
-    check("overlap_features_reproduce_old_locked_panel", len(failed_overlap_cols) == 0, f"failed_cols={failed_overlap_cols}")
+    check("historical_source_migration_comparison_written", True, f"report_only_failed_cols={failed_overlap_cols}")
+
+    required_source_cols = ["spy_close_for_features", "spy_log_return", "feature_return_source"]
+    missing_source_cols = [c for c in required_source_cols if c not in out.columns]
+    check("canonical_spy_source_columns_present", not missing_source_cols, f"missing={missing_source_cols}")
+    if not missing_source_cols:
+        observed_sources = sorted(out["feature_return_source"].dropna().astype(str).unique().tolist())
+        check("feature_return_source_is_spy", observed_sources == ["SPY"], f"observed={observed_sources}")
+        alias_close_diff = float((pd.to_numeric(out["spx_close_for_features"], errors="coerce") - pd.to_numeric(out["spy_close_for_features"], errors="coerce")).abs().max())
+        alias_return_diff = float((pd.to_numeric(out["spx_log_return"], errors="coerce") - pd.to_numeric(out["spy_log_return"], errors="coerce")).abs().max())
+        check("legacy_aliases_equal_spy", alias_close_diff <= 1e-12 and alias_return_diff <= 1e-12, f"close_diff={alias_close_diff:.3e}; return_diff={alias_return_diff:.3e}")
 
     validation = pd.DataFrame(checks)
     validation_path = audit_dir / f"locked_cell4_feature_update_validation_{run_ts}.csv"
