@@ -43,4 +43,4 @@ The following were removed because they were duplicated, superseded, or better r
 - duplicate `README.md` and `requirements.txt` under `docs/`;
 - temporary documentation-review report.
 
-They remain recoverable from Git history or the pre-cleanup backup created by the cleanup script.
+They remain recoverable from Git history or, where retained for provenance, under [`old/`](../old/ARCHIVE_INDEX.md).

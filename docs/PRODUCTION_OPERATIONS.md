@@ -53,6 +53,8 @@ python -u notebooks\vrp_hybrid_v2_eod_pipeline.py `
 
 The default target is the latest completed XNYS session after the configured close buffer.
 
+For a same-day refresh, wait until ThetaData has published the stock EOD record (normally after approximately 5:15 p.m. ET). If the requested SPY EOD row is unavailable, retain the prior accepted production output and retry later; do not manufacture a same-day close.
+
 ### Diagnostic modes
 
 ```text

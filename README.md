@@ -1,6 +1,6 @@
 # VRP Project
 
-Private research and production repository for the SPY/SPX volatility-risk-premium system.
+Public research and production repository for the SPY/SPX volatility-risk-premium system. Market data, generated outputs, credentials, and local workbooks remain excluded from Git.
 
 The current production release is `vrp_corsi_intraday_hybrid_v2`. Despite the historical release name, the active trading decision is a **completed-EOD** process. It does not place orders or produce a live intraday execution signal.
 
@@ -69,6 +69,8 @@ Omit `--no-thetadata-probe` when ThetaData connectivity should be tested.
 
 ## Launch the dashboard
 
+On the production computer, run `START VRP HYBRID V2.bat`. The equivalent direct command is:
+
 ```powershell
 python -m streamlit run notebooks\streamlit_vrp_hybrid_v2_eod.py
 ```
@@ -76,10 +78,11 @@ python -m streamlit run notebooks\streamlit_vrp_hybrid_v2_eod.py
 ## Repository layout
 
 - `config/` — active model and runtime configuration
-- `notebooks/` — research notebooks and production Python entry points
+- `notebooks/` — active production Python entry points and current research
 - `tests/` — regression tests for production contracts
 - `docs/` — active documentation and immutable model-lock records
 - `data/` — local-only market data, generated outputs, and audit records; excluded from Git
+- `old/` — retained historical code, superseded repairs, and abandoned experiments; see `old/ARCHIVE_INDEX.md`
 
 ## Data policy
 
@@ -103,4 +106,4 @@ The model-lock DOCX is immutable. Current operations are documented separately s
 
 ## Current research priority
 
-The next primary workstream is portfolio-level overlap, concentration, and stress sizing for the put sleeve. Signal re-optimization is not the priority. See [`docs/CURRENT_STATUS_AND_ROADMAP.md`](docs/CURRENT_STATUS_AND_ROADMAP.md).
+Put-sleeve portfolio sizing is intentionally deferred. The next primary workstream is exact Python replication of the existing 30D Excel short-call sleeve before testing a Corsi denominator or additional tenors. See [`docs/CURRENT_STATUS_AND_ROADMAP.md`](docs/CURRENT_STATUS_AND_ROADMAP.md).
