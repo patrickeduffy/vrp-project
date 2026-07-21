@@ -375,11 +375,15 @@ def rebuild_from_seed(
     seed = valid.sort_values("trade_date").iloc[-1]
     seed_date = pd.Timestamp(seed["trade_date"])
 
-    # Preserve only the earliest valid long-warmup seed. Every later observation is
-    # rebuilt from the clean canonical XNYS-session SPY close sequence.
-    preserved = pd.DataFrame([seed]).copy()
-    preserved["rsi_formula_version"] = FORMULA_VERSION
-    preserved["source_name"] = (
+    # Preserve the complete accepted history through the selected seed. For a formula
+    # migration the seed is the earliest accepted row, so this still preserves one row
+    # and rebuilds the full tail. For a normal incremental extension the seed is the
+    # latest accepted row before recalc_start, so all previously accepted history must
+    # remain present rather than becoming null after the canonical-date merge below.
+    preserved = existing.loc[existing["trade_date"].le(seed_date)].copy()
+    seed_mask = preserved["trade_date"].eq(seed_date)
+    preserved.loc[seed_mask, "rsi_formula_version"] = FORMULA_VERSION
+    preserved.loc[seed_mask, "source_name"] = (
         "canonical_spy_eod_prices_v1; clean-session recursive rebuild from accepted initial seed"
     )
     canonical_seed_close = float(
@@ -387,9 +391,9 @@ def rebuild_from_seed(
     )
     if abs(float(seed["spy_close"]) - canonical_seed_close) > CLOSE_TOLERANCE:
         raise RuntimeError("The accepted initial RSI seed close does not match canonical SPY.")
-    preserved["spy_close"] = canonical_seed_close
+    preserved.loc[seed_mask, "spy_close"] = canonical_seed_close
 
-    prev_close = float(preserved.iloc[0]["spy_close"])
+    prev_close = canonical_seed_close
     prev_avg_gain = float(seed["wilder_avg_gain_14"])
     prev_avg_loss = float(seed["wilder_avg_loss_14"])
     new_rows: list[dict[str, Any]] = []

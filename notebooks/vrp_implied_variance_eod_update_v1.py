@@ -50,6 +50,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as dt_time, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -143,6 +144,35 @@ def _coerce_yyyymmdd_date(value: Any) -> pd.Timestamp:
     return pd.Timestamp(pd.to_datetime(value, errors="raise")).normalize()
 
 
+@lru_cache(maxsize=1)
+def _production_xnys_close_minutes_by_date() -> Dict[int, int]:
+    """Build the XNYS close-minute lookup once for the supported expiration range."""
+    start_date = "2009-01-01"
+    end_date = "2035-12-31"
+    if mcal is not None:
+        cal = mcal.get_calendar("XNYS")
+        schedule = cal.schedule(start_date=start_date, end_date=end_date)
+        rows = schedule["market_close"].items()
+    elif xcals is not None:
+        cal = xcals.get_calendar("XNYS")
+        sessions = cal.sessions_in_range(start_date, end_date)
+        rows = ((session, cal.session_close(session)) for session in sessions)
+    else:
+        raise RuntimeError(
+            "An XNYS calendar package is required for expiration-aware SPXW settlement timing."
+        )
+
+    result: Dict[int, int] = {}
+    for session, close_ts in rows:
+        close_ts = pd.Timestamp(close_ts)
+        if close_ts.tzinfo is None:
+            close_ts = close_ts.tz_localize("UTC")
+        close_et = close_ts.tz_convert("America/New_York")
+        session_key = int(pd.Timestamp(session).strftime("%Y%m%d"))
+        result[session_key] = int(close_et.hour * 60 + close_et.minute)
+    return result
+
+
 def production_spxw_settlement_minutes(expiration_date: Any) -> int:
     """Return the official XNYS close minute for a PM-settled SPXW expiration.
 
@@ -152,29 +182,14 @@ def production_spxw_settlement_minutes(expiration_date: Any) -> int:
     a normal close.
     """
     exp_ts = _coerce_yyyymmdd_date(expiration_date)
-    if mcal is not None:
-        cal = mcal.get_calendar("XNYS")
-        schedule = cal.schedule(start_date=exp_ts.date(), end_date=exp_ts.date())
-        if schedule.empty:
-            raise RuntimeError(
-                f"SPXW expiration {exp_ts.date()} is not an XNYS trading session."
-            )
-        close_ts = schedule.iloc[0]["market_close"]
-    elif xcals is not None:
-        cal = xcals.get_calendar("XNYS")
-        if not cal.is_session(exp_ts):
-            raise RuntimeError(
-                f"SPXW expiration {exp_ts.date()} is not an XNYS trading session."
-            )
-        close_ts = cal.session_close(exp_ts)
-    else:
+    expiration_key = int(exp_ts.strftime("%Y%m%d"))
+    close_minutes = _production_xnys_close_minutes_by_date()
+    if expiration_key not in close_minutes:
         raise RuntimeError(
-            "An XNYS calendar package is required for expiration-aware SPXW settlement timing."
+            f"SPXW expiration {exp_ts.date()} is not an XNYS trading session "
+            "inside the supported 2009-2035 calendar range."
         )
-    if close_ts.tzinfo is None:
-        close_ts = close_ts.tz_localize("UTC")
-    close_et = close_ts.tz_convert("America/New_York")
-    return int(close_et.hour * 60 + close_et.minute)
+    return close_minutes[expiration_key]
 
 
 def production_settlement_minutes_after_midnight_et(root: str, expiration_date: Any) -> int:
@@ -1917,6 +1932,7 @@ def run(cfg: Config) -> int:
         print_header("Calculating target dates")
         for d in target_dates:
             print(f"Calculating {date_str(d)} ...")
+            calculation_started = time.perf_counter()
             row_base = {"trade_date": date_str(d), "status": "started", "rows": None, "error": None}
             try:
                 calc_df, detail = call_calculation_function(ns, d, cfg)
@@ -1945,7 +1961,11 @@ def run(cfg: Config) -> int:
                 for attempt in detail.get("attempts", []):
                     attempt_row = {"trade_date": date_str(d), **attempt}
                     calc_log_rows.append(attempt_row)
-                print(f"  OK rows={len(calc_df)} tenors={row_base['tenors']}")
+                elapsed_seconds = time.perf_counter() - calculation_started
+                row_base["elapsed_seconds"] = elapsed_seconds
+                print(
+                    f"  OK rows={len(calc_df)} tenors={row_base['tenors']} elapsed={elapsed_seconds:.2f}s"
+                )
             except Exception as exc:
                 row_base.update({"status": "failed", "error": repr(exc)})
                 print(f"  FAILED: {repr(exc)}")
