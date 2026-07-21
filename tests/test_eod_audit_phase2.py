@@ -28,6 +28,18 @@ rsi = load_module("phase2_rsi", "notebooks/vrp_hybrid_v2_wilder_rsi_update.py")
 publisher = load_module("phase2_publisher", "notebooks/vrp_hybrid_v2_signal_publish.py")
 
 
+class ImpliedVarianceCalendarCacheTests(unittest.TestCase):
+    def test_calendar_lookup_is_cached_and_preserves_early_close(self):
+        iv._production_xnys_close_minutes_by_date.cache_clear()
+        first = iv._production_xnys_close_minutes_by_date()
+        info_after_first = iv._production_xnys_close_minutes_by_date.cache_info()
+        second = iv._production_xnys_close_minutes_by_date()
+        info_after_second = iv._production_xnys_close_minutes_by_date.cache_info()
+        self.assertIs(first, second)
+        self.assertEqual(info_after_second.hits, info_after_first.hits + 1)
+        self.assertEqual(iv.production_spxw_settlement_minutes(20251128), 13 * 60)
+
+
 class SofrAndUpsertTests(unittest.TestCase):
     def test_explicit_upsert_new_key_wins_with_null_old_timestamp(self):
         old = pd.DataFrame({
@@ -99,6 +111,53 @@ class RsiRepairTests(unittest.TestCase):
         self.assertTrue(output["rsi_formula_version"].eq(rsi.FORMULA_VERSION).all())
         diag = rsi.recurrence_diagnostics(output)
         self.assertLessEqual(max(v for k, v in diag.items() if k.startswith("max_")), 1e-10)
+
+    def test_incremental_extension_preserves_complete_accepted_history(self):
+        canonical, legacy = self.synthetic_inputs()
+        migration_start, _ = rsi.find_recalc_start(
+            canonical, legacy, force_full_refresh=False
+        )
+        accepted, _ = rsi.rebuild_from_seed(canonical, legacy, migration_start)
+
+        next_date = canonical["trade_date"].max() + pd.offsets.BDay(1)
+        canonical_extended = pd.concat(
+            [
+                canonical,
+                pd.DataFrame(
+                    {
+                        "trade_date": [next_date],
+                        "spy_close": [float(canonical["spy_close"].iloc[-1]) + 0.5],
+                    }
+                ),
+            ],
+            ignore_index=True,
+        )
+        recalc_start, reasons = rsi.find_recalc_start(
+            canonical_extended, accepted, force_full_refresh=False
+        )
+        self.assertEqual(recalc_start, next_date)
+        self.assertEqual(reasons, ["missing_rsi_row"])
+
+        output, meta = rsi.rebuild_from_seed(
+            canonical_extended, accepted, recalc_start
+        )
+        self.assertEqual(meta["preserved_rows"], len(accepted))
+        self.assertEqual(len(output), len(canonical_extended))
+        self.assertFalse(output.isna().any().any())
+        self.assertAlmostEqual(
+            float(output.iloc[-1]["spy_change"]),
+            float(canonical_extended.iloc[-1]["spy_close"])
+            - float(canonical_extended.iloc[-2]["spy_close"]),
+        )
+        diag = rsi.recurrence_diagnostics(output)
+        self.assertLessEqual(
+            max(v for k, v in diag.items() if k.startswith("max_")), 1e-10
+        )
+        pd.testing.assert_frame_equal(
+            output.iloc[:-1].reset_index(drop=True),
+            accepted.reset_index(drop=True),
+            check_dtype=False,
+        )
 
     def test_validation_detects_corrupted_change(self):
         canonical, existing = self.synthetic_inputs()
