@@ -1,0 +1,9 @@
+# Direct dependencies for the completed-EOD production pipeline.
+# Versions match the validated Python 3.13 environment on 2026-07-20.
+numpy==2.2.3
+pandas==2.2.3
+pandas-market-calendars==5.4.0
+pyarrow==24.0.0
+requests==2.32.3
+scikit-learn==1.9.0
+streamlit==1.58.0
