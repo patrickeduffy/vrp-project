@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import math
 import os
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
@@ -14,6 +16,8 @@ from uuid import uuid4
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 TEST_DSN = os.environ.get("VRP_TEST_DATABASE_URL")
+EOD_TEST_CODE_VERSION = "1" * 40
+EOD_ROLLBACK_CODE_VERSION = "2" * 40
 
 if TEST_DSN:
     try:
@@ -39,6 +43,22 @@ from vrp.storage.reference_data import (
     daily_market_feature_definition_sha256,
 )
 from tests.test_reference_history_normalization import synthetic_spy_frames
+from vrp.eod_shadow.models import (
+    ArtifactMetadata,
+    EodSnapshot,
+    ForecastVarianceRecord,
+    GoldenVerificationEvidence,
+    ImpliedVarianceRecord,
+    MarketSnapshotRecord,
+    SelectedSignalRecord,
+    SignalEvaluationRecord,
+    SignalFeatureRecord,
+    TARGET_TENORS,
+    VersionedDocument,
+)
+from vrp.eod_shadow.sofr_evidence import SofrUpdaterEvidence
+from vrp.eod_shadow.service import execute_eod_shadow_load
+from vrp.storage.eod_postgres import PostgresEodRepository
 
 
 def local_path_from_file_uri(uri: str) -> Path:
@@ -49,8 +69,242 @@ def local_path_from_file_uri(uri: str) -> Path:
     return path
 
 
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _write_version_document(path: Path, payload: bytes) -> str:
+    path.write_bytes(payload)
+    return _sha256_bytes(payload)
+
+
+def synthetic_eod_snapshot(root: Path) -> EodSnapshot:
+    """Build a complete validated no-trade snapshot without running calculators."""
+
+    valuation_date = date(2030, 1, 4)
+    run_dir = root / "completed-eod-run"
+    staging = run_dir / "staging"
+    staging.mkdir(parents=True)
+
+    model_path = root / "model-lock.json"
+    model_bytes = b'{"lock_date":"2029-12-01","model":"locked-corsi"}'
+    model_sha256 = _write_version_document(model_path, model_bytes)
+    configuration_path = root / "signal-configuration.json"
+    configuration_bytes = b'{"selection":"locked","thresholds":"production"}'
+    configuration_sha256 = _write_version_document(
+        configuration_path, configuration_bytes
+    )
+
+    signal_path = staging / "signal-history.parquet"
+    signal_bytes = b"synthetic-validated-eod-signal-history-v1"
+    signal_sha256 = _write_version_document(signal_path, signal_bytes)
+    fixture_path = root / "golden-eod-fixture.json"
+    fixture_bytes = (
+        b'{"captured_at_utc":"2029-12-01T00:00:00+00:00",'
+        b'"fixture":"accepted-synthetic-eod"}'
+    )
+    fixture_sha256 = _write_version_document(fixture_path, fixture_bytes)
+    sofr_manifest_path = root / "sofr_update_manifest.json"
+    sofr_manifest_bytes = b'{"status":"PUBLISHED","source":"FRED_SOFR"}'
+    sofr_manifest_sha256 = _write_version_document(
+        sofr_manifest_path, sofr_manifest_bytes
+    )
+    sofr_snapshot_path = root / "sofr_refreshed_snapshot.csv"
+    sofr_snapshot_bytes = b"observation_date,SOFR\n2030-01-03,3.57\n"
+    sofr_snapshot_sha256 = _write_version_document(
+        sofr_snapshot_path, sofr_snapshot_bytes
+    )
+
+    implied = tuple(
+        ImpliedVarianceRecord(
+            tenor_days=tenor,
+            target_expiration=valuation_date + timedelta(days=tenor),
+            effective_dte=float(tenor),
+            annualized_variance=0.022 + tenor / 100_000,
+            annualized_volatility_pct=math.sqrt(0.022 + tenor / 100_000) * 100,
+            quality_details={"source": "synthetic-integration"},
+        )
+        for tenor in TARGET_TENORS
+    )
+    forecast = tuple(
+        ForecastVarianceRecord(
+            tenor_days=tenor,
+            forecast_as_of_date=valuation_date,
+            predicted_log_variance=math.log(0.017 + tenor / 100_000),
+            annualized_variance=0.017 + tenor / 100_000,
+            annualized_volatility_pct=math.sqrt(0.017 + tenor / 100_000) * 100,
+            quality_details={"model": "synthetic-locked"},
+        )
+        for tenor in TARGET_TENORS
+    )
+    features = tuple(
+        SignalFeatureRecord(
+            tenor_days=tenor,
+            tenor_bucket=(
+                "FRONT" if tenor <= 18 else "MIDDLE" if tenor <= 24 else "BACK"
+            ),
+            vrp_log=math.log(
+                implied[index].annualized_variance
+                / forecast[index].annualized_variance
+            ),
+            vrp_3m_prior_mean=0.20,
+            vrp_3m_prior_sample_std=0.10,
+            vrp_1y_prior_mean=0.15,
+            vrp_1y_prior_sample_std=0.20,
+            zscore_3m=0.25,
+            zscore_1y=0.30,
+            rsi14=52.0,
+            rv21d_variance=0.0144,
+            rv21d_volatility_pct=12.0,
+            zscore_3m_sample_count=63,
+            zscore_1y_sample_count=252,
+            history_through_date=valuation_date - timedelta(days=1),
+            details={"source": "synthetic-integration"},
+        )
+        for index, tenor in enumerate(TARGET_TENORS)
+    )
+    evaluations = tuple(
+        SignalEvaluationRecord(
+            evaluation_key=f"{layer}:{tenor}",
+            tenor_days=tenor,
+            tenor_bucket=features[index].tenor_bucket,
+            signal_layer=layer,
+            evaluation_status="INACTIVE",
+            qualifies=False,
+            vrp_pass=None,
+            zscore_3m_pass=None,
+            zscore_1y_pass=None,
+            rsi14_pass=None,
+            rv21d_pass=None,
+            threshold_values={},
+            comparison_results={"rule_exists": False},
+            failed_checks=("RULE_INACTIVE",),
+            rank_position=None,
+            rank_score=None,
+            target_size_pct_nav=None,
+            details={"source": "synthetic-integration"},
+        )
+        for index, tenor in enumerate(TARGET_TENORS)
+        for layer in ("CORE", "SECONDARY")
+    )
+
+    return EodSnapshot(
+        run_dir=run_dir.resolve(),
+        valuation_date=valuation_date,
+        lock_id="synthetic-eod-lock-v1",
+        approved_nav=1_000_000.0,
+        run_manifest={
+            "status": "PASS",
+            "finished_at": "2030-01-04T21:05:00+00:00",
+        },
+        publish_manifest={"status": "PASS", "authoritative": False},
+        model_identity=VersionedDocument(
+            key="unified_fds_no_min_return",
+            version_label="synthetic-locked-v1",
+            path=model_path.resolve(),
+            sha256=model_sha256,
+            payload={"lock_date": "2029-12-01", "model": "locked-corsi"},
+        ),
+        configuration_identity=VersionedDocument(
+            key="put_signal_configuration",
+            version_label="synthetic-locked-v1",
+            path=configuration_path.resolve(),
+            sha256=configuration_sha256,
+            payload={"selection": "locked", "thresholds": "production"},
+        ),
+        sofr_evidence=SofrUpdaterEvidence(
+            updater_manifest_path=sofr_manifest_path.resolve(),
+            updater_manifest_sha256=sofr_manifest_sha256,
+            refreshed_snapshot_path=sofr_snapshot_path.resolve(),
+            refreshed_snapshot_sha256=sofr_snapshot_sha256,
+            normalized_content_sha256="8" * 64,
+            start_date=date(2030, 1, 3),
+            end_date=date(2030, 1, 3),
+            row_count=1,
+            observation_date=date(2030, 1, 3),
+            rate_decimal=Decimal("0.0357"),
+            row_sha256="d" * 64,
+        ),
+        market_snapshot=MarketSnapshotRecord(
+            valuation_date=valuation_date,
+            snapshot_at=datetime(2030, 1, 4, 21, tzinfo=timezone.utc),
+            data_cutoff_at=datetime(2030, 1, 4, 21, tzinfo=timezone.utc),
+            snapshot_kind="EOD_OFFICIAL",
+            market_session="CLOSED",
+            freshness_status="FRESH",
+            spy_price=748.32,
+            details={"source": "synthetic-integration"},
+        ),
+        implied_variance=implied,
+        forecast_variance=forecast,
+        signal_features=features,
+        signal_evaluations=evaluations,
+        selected_signal=SelectedSignalRecord(
+            decision="NO_TRADE",
+            signal_state="EOD_OFFICIAL",
+            selection_rule_id="synthetic-locked-selection-v1",
+            selected_evaluation_key=None,
+            no_trade_reason="NO_CORE_OR_SECONDARY_SIGNAL_QUALIFIED",
+            approved_nav_dollars=1_000_000.0,
+            target_max_risk_dollars=None,
+            selection_trace={"qualified": []},
+        ),
+        artifacts=(
+            ArtifactMetadata(
+                logical_name="signal_history",
+                path=signal_path.resolve(),
+                asset_format="PARQUET",
+                sha256=signal_sha256,
+                byte_size=len(signal_bytes),
+                row_count=9,
+                relative_path="staging/signal-history.parquet",
+                identity_input=True,
+                metadata={"synthetic": True},
+            ),
+            ArtifactMetadata(
+                logical_name="sofr_update_manifest",
+                path=sofr_manifest_path.resolve(),
+                asset_format="JSON",
+                sha256=sofr_manifest_sha256,
+                byte_size=len(sofr_manifest_bytes),
+                relative_path="reference/sofr_update_manifest.json",
+                identity_input=True,
+                metadata={"synthetic": True},
+            ),
+            ArtifactMetadata(
+                logical_name="sofr_refreshed_snapshot",
+                path=sofr_snapshot_path.resolve(),
+                asset_format="CSV",
+                sha256=sofr_snapshot_sha256,
+                byte_size=len(sofr_snapshot_bytes),
+                row_count=1,
+                relative_path="reference/sofr_refreshed_snapshot.csv",
+                identity_input=True,
+                metadata={"synthetic": True},
+                trade_date_start=date(2030, 1, 3),
+                trade_date_end=date(2030, 1, 3),
+            ),
+        ),
+        golden_evidence=GoldenVerificationEvidence(
+            status="PASS",
+            verification_id="a" * 64,
+            fixture_path=fixture_path.resolve(),
+            fixture_sha256=fixture_sha256,
+            signal_history_sha256=signal_sha256,
+            selected_decisions_sha256="b" * 64,
+            manifest={"status": "PASS"},
+        ),
+        output_fingerprint="c" * 64,
+    )
+
+
 @unittest.skipUnless(TEST_DSN, "VRP test PostgreSQL is not configured")
 class PostgresMigrationIntegrationTests(unittest.TestCase):
+    migrations = (
+        ROOT / "migrations/0001_operational_schema.sql",
+        ROOT / "migrations/0002_reference_data.sql",
+    )
+
     @classmethod
     def setUpClass(cls):
         cls.connection = psycopg.connect(TEST_DSN, autocommit=True)
@@ -61,20 +315,35 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     raise RuntimeError(
                         "VRP_TEST_DATABASE_URL must point to a fresh disposable test database"
                     )
-                for migration in (
-                    ROOT / "migrations/0001_operational_schema.sql",
-                    ROOT / "migrations/0002_reference_data.sql",
-                ):
-                    cursor.execute(migration.read_text(encoding="utf-8"), prepare=False)
-            cls.repository_connection = psycopg.connect(TEST_DSN)
         except Exception:
             cls.connection.close()
             raise
 
+    def setUp(self):
+        # Every integration test receives its own freshly migrated VRP schema.
+        # The class-level guard above ensures this can only target a database
+        # that was empty when the suite started.
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("DROP SCHEMA IF EXISTS vrp CASCADE")
+                for migration in self.migrations:
+                    cursor.execute(
+                        migration.read_text(encoding="utf-8"),
+                        prepare=False,
+                    )
+        except Exception:
+            self.connection.rollback()
+            raise
+        self.repository_connection = psycopg.connect(TEST_DSN)
+
+    def tearDown(self):
+        try:
+            self.repository_connection.rollback()
+        finally:
+            self.repository_connection.close()
+
     @classmethod
     def tearDownClass(cls):
-        cls.repository_connection.rollback()
-        cls.repository_connection.close()
         cls.connection.close()
 
     def _insert_asset(self, dataset_name: str, digest_character: str):
@@ -151,6 +420,315 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 ),
             )
         return run_id, snapshot_at
+
+    def _seed_eod_reference_pins(self, valuation_date: date) -> None:
+        """Insert one accepted prior SOFR row and one exact-date SPY feature."""
+
+        sofr_asset_id = self._insert_asset("eod_shadow_sofr_pin", "8")
+        spy_asset_id = self._insert_asset("eod_shadow_spy_pin", "9")
+        sofr_release_id = uuid4()
+        spy_release_id = uuid4()
+        sofr_observation_id = uuid4()
+        daily_feature_id = uuid4()
+        definition_id = uuid4()
+        definition_sha256 = (
+            "71854988797daedd685fa8d9a140fdcbd8dddaa8c2d7cd1c59c23e7f97a0371d"
+        )
+        prior_date = valuation_date - timedelta(days=1)
+
+        with self.repository_connection.transaction():
+            with self.repository_connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO vrp.daily_market_feature_definitions (
+                        daily_market_feature_definition_id, definition_key,
+                        version_label, content_sha256, price_adjustment,
+                        return_formula_version, rsi_formula_version,
+                        rv_formula_version, definition
+                    ) VALUES (
+                        %s, %s, %s, %s, 'UNKNOWN', %s, %s, %s, %s::jsonb
+                    )
+                    ON CONFLICT DO NOTHING
+                    RETURNING daily_market_feature_definition_id
+                    """,
+                    (
+                        definition_id,
+                        "SPY_SIGNAL_FEATURES",
+                        "v1-71854988797d",
+                        definition_sha256,
+                        "canonical_spy_close_log_return_v1",
+                        "wilder_rsi14_spy_close_v3_clean_session_rebuild",
+                        "sample_std_log_return_21d_ddof1_annualized_252_v1",
+                        '{"source":"synthetic-integration"}',
+                    ),
+                )
+                inserted_definition = cursor.fetchone()
+                if inserted_definition is None:
+                    cursor.execute(
+                        """
+                        SELECT daily_market_feature_definition_id
+                        FROM vrp.daily_market_feature_definitions
+                        WHERE content_sha256 = %s
+                        """,
+                        (definition_sha256,),
+                    )
+                    definition_id = cursor.fetchone()[0]
+                else:
+                    definition_id = inserted_definition[0]
+
+                cursor.execute(
+                    """
+                    INSERT INTO vrp.reference_data_releases (
+                        reference_data_release_id, dataset_key, dataset_kind,
+                        dataset_schema_version, normalized_content_sha256,
+                        source_system, loader_version, normalized_data_asset_id,
+                        vintage_kind, retrieved_at, observation_start_date,
+                        observation_end_date, source_row_count, persisted_row_count
+                    ) VALUES (
+                        %s, %s, 'REFERENCE_RATE', 'v1', %s, 'FRED', 'test-v1',
+                        %s, 'LATEST_REVISED', %s, %s, %s, 1, 1
+                    )
+                    """,
+                    (
+                        sofr_release_id,
+                        "FRED_SOFR_EOD_SHADOW_INTEGRATION",
+                        "8" * 64,
+                        sofr_asset_id,
+                        datetime(2030, 1, 4, 12, tzinfo=timezone.utc),
+                        prior_date,
+                        prior_date,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO vrp.reference_rate_observations (
+                        reference_rate_observation_id, reference_data_release_id,
+                        series_key, observation_date, rate_percent, row_sha256
+                    ) VALUES (%s, %s, 'SOFR', %s, 3.57, %s)
+                    """,
+                    (
+                        sofr_observation_id,
+                        sofr_release_id,
+                        prior_date,
+                        "d" * 64,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO vrp.reference_data_releases (
+                        reference_data_release_id, dataset_key, dataset_kind,
+                        dataset_schema_version, normalized_content_sha256,
+                        source_system, loader_version, normalized_data_asset_id,
+                        vintage_kind, retrieved_at, observation_start_date,
+                        observation_end_date, source_row_count, persisted_row_count
+                    ) VALUES (
+                        %s, %s, 'DAILY_MARKET_FEATURES', 'v1', %s,
+                        'THETADATA_AND_DERIVED', 'test-v1', %s,
+                        'LATEST_REVISED', %s, %s, %s, 1, 1
+                    )
+                    """,
+                    (
+                        spy_release_id,
+                        "SPY_SIGNAL_DAILY_EOD_SHADOW_INTEGRATION",
+                        "9" * 64,
+                        spy_asset_id,
+                        datetime(2030, 1, 4, 22, tzinfo=timezone.utc),
+                        valuation_date,
+                        valuation_date,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO vrp.daily_market_features (
+                        daily_market_feature_id,
+                        daily_market_feature_definition_id,
+                        reference_data_release_id, symbol, trade_date,
+                        prior_trade_date, spy_close, spy_change, spy_log_return,
+                        wilder_avg_gain_14, wilder_avg_loss_14, rsi14,
+                        rv21d_variance, rv21d_volatility_pct,
+                        calculation_status, quality_status, row_sha256, details
+                    ) VALUES (
+                        %s, %s, %s, 'SPY', %s, %s, 748.32, 1.20, 0.001605,
+                        2.10, 1.90, 52.0, 0.0144, 12.0,
+                        'AVAILABLE', 'PASS', %s, %s::jsonb
+                    )
+                    """,
+                    (
+                        daily_feature_id,
+                        definition_id,
+                        spy_release_id,
+                        valuation_date,
+                        prior_date,
+                        "e" * 64,
+                        '{"source":"synthetic-integration"}',
+                    ),
+                )
+
+    def test_eod_shadow_service_is_atomic_idempotent_and_non_publishing(self):
+        class InjectedReconciliationFailureRepository(PostgresEodRepository):
+            def fetch_run_projection(self, pipeline_run_id):
+                raise RuntimeError("injected EOD reconciliation failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = synthetic_eod_snapshot(Path(directory))
+            self._seed_eod_reference_pins(snapshot.valuation_date)
+
+            with psycopg.connect(TEST_DSN) as eod_connection:
+                first = execute_eod_shadow_load(
+                    eod_connection,
+                    snapshot,
+                    environment="integration-eod-shadow",
+                    code_version=EOD_TEST_CODE_VERSION,
+                    requested_by="integration-test",
+                )
+                self.assertFalse(first.no_op)
+                self.assertEqual(first.implied_variance_count, 9)
+                self.assertEqual(first.forecast_variance_count, 9)
+                self.assertEqual(first.signal_feature_count, 9)
+                self.assertEqual(first.signal_evaluation_count, 18)
+
+                with self.connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            run.status,
+                            run.qa_status,
+                            (SELECT COUNT(*) FROM vrp.market_snapshots AS item
+                             WHERE item.pipeline_run_id = run.pipeline_run_id),
+                            (SELECT COUNT(*)
+                             FROM vrp.implied_variance_term_structure AS item
+                             WHERE item.pipeline_run_id = run.pipeline_run_id),
+                            (SELECT COUNT(*)
+                             FROM vrp.forecast_variance_term_structure AS item
+                             WHERE item.pipeline_run_id = run.pipeline_run_id),
+                            (SELECT COUNT(*) FROM vrp.signal_features AS item
+                             WHERE item.pipeline_run_id = run.pipeline_run_id),
+                            (SELECT COUNT(*) FROM vrp.signal_evaluations AS item
+                             WHERE item.pipeline_run_id = run.pipeline_run_id),
+                            (SELECT COUNT(*) FROM vrp.selected_signals AS item
+                             WHERE item.pipeline_run_id = run.pipeline_run_id),
+                            (SELECT COUNT(*) FROM vrp.qa_results AS qa
+                             WHERE qa.pipeline_run_id = run.pipeline_run_id),
+                            (SELECT COUNT(*) FROM vrp.qa_results AS qa
+                             WHERE qa.pipeline_run_id = run.pipeline_run_id
+                               AND qa.is_hard_gate AND qa.outcome = 'PASS'),
+                            (SELECT array_agg(qa.check_code ORDER BY qa.check_code)
+                             FROM vrp.qa_results AS qa
+                             WHERE qa.pipeline_run_id = run.pipeline_run_id),
+                            (SELECT COUNT(*) FROM vrp.pipeline_run_stages AS stage
+                             WHERE stage.pipeline_run_id = run.pipeline_run_id
+                               AND stage.status = 'COMPLETED'),
+                            (SELECT COUNT(*) FROM vrp.signal_publications AS publication
+                             WHERE publication.pipeline_run_id = run.pipeline_run_id)
+                        FROM vrp.pipeline_runs AS run
+                        WHERE run.pipeline_run_id = %s
+                        """,
+                        (first.pipeline_run_id,),
+                    )
+                    self.assertEqual(
+                        cursor.fetchone(),
+                        (
+                            "COMPLETED",
+                            "PASS",
+                            1,
+                            9,
+                            9,
+                            9,
+                            18,
+                            1,
+                            2,
+                            2,
+                            [
+                                "golden_eod_contract",
+                                "postgres_projection_reconciliation",
+                            ],
+                            1,
+                            0,
+                        ),
+                    )
+
+                repeated = execute_eod_shadow_load(
+                    eod_connection,
+                    snapshot,
+                    environment="integration-eod-shadow",
+                    code_version=EOD_TEST_CODE_VERSION,
+                    requested_by="integration-test",
+                )
+                self.assertTrue(repeated.no_op)
+                self.assertEqual(repeated.pipeline_run_id, first.pipeline_run_id)
+                self.assertEqual(repeated.market_snapshot_id, first.market_snapshot_id)
+                self.assertEqual(repeated.selected_signal_id, first.selected_signal_id)
+
+                with self.assertRaisesRegex(
+                    RuntimeError, "injected EOD reconciliation failure"
+                ):
+                    execute_eod_shadow_load(
+                        eod_connection,
+                        snapshot,
+                        environment="integration-eod-shadow",
+                        code_version=EOD_ROLLBACK_CODE_VERSION,
+                        requested_by="integration-test",
+                        repository_factory=InjectedReconciliationFailureRepository,
+                    )
+
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        COUNT(*),
+                        (SELECT COUNT(*) FROM vrp.market_snapshots AS snapshot
+                         JOIN vrp.pipeline_runs AS run
+                           ON run.pipeline_run_id = snapshot.pipeline_run_id
+                         WHERE run.run_kind = 'EOD'
+                           AND run.valuation_date = %s),
+                        (SELECT COUNT(*) FROM vrp.implied_variance_term_structure AS item
+                         JOIN vrp.pipeline_runs AS run
+                           ON run.pipeline_run_id = item.pipeline_run_id
+                         WHERE run.run_kind = 'EOD'
+                           AND run.valuation_date = %s),
+                        (SELECT COUNT(*) FROM vrp.forecast_variance_term_structure AS item
+                         JOIN vrp.pipeline_runs AS run
+                           ON run.pipeline_run_id = item.pipeline_run_id
+                         WHERE run.run_kind = 'EOD'
+                           AND run.valuation_date = %s),
+                        (SELECT COUNT(*) FROM vrp.signal_features AS item
+                         JOIN vrp.pipeline_runs AS run
+                           ON run.pipeline_run_id = item.pipeline_run_id
+                         WHERE run.run_kind = 'EOD'
+                           AND run.valuation_date = %s),
+                        (SELECT COUNT(*) FROM vrp.signal_evaluations AS item
+                         JOIN vrp.pipeline_runs AS run
+                           ON run.pipeline_run_id = item.pipeline_run_id
+                         WHERE run.run_kind = 'EOD'
+                           AND run.valuation_date = %s),
+                        (SELECT COUNT(*) FROM vrp.selected_signals AS item
+                         JOIN vrp.pipeline_runs AS run
+                           ON run.pipeline_run_id = item.pipeline_run_id
+                         WHERE run.run_kind = 'EOD'
+                           AND run.valuation_date = %s),
+                        (SELECT COUNT(*) FROM vrp.signal_publications AS publication
+                         JOIN vrp.pipeline_runs AS run
+                           ON run.pipeline_run_id = publication.pipeline_run_id
+                         WHERE run.run_kind = 'EOD'
+                           AND run.valuation_date = %s)
+                    FROM vrp.pipeline_runs AS run
+                    WHERE run.run_kind = 'EOD'
+                      AND run.valuation_date = %s
+                    """,
+                    (snapshot.valuation_date,) * 8,
+                )
+                self.assertEqual(cursor.fetchone(), (1, 1, 9, 9, 9, 18, 1, 0))
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM vrp.pipeline_runs
+                    WHERE run_kind = 'EOD'
+                      AND valuation_date = %s
+                      AND code_version = %s
+                    """,
+                    (snapshot.valuation_date, EOD_ROLLBACK_CODE_VERSION),
+                )
+                self.assertEqual(cursor.fetchone()[0], 0)
 
     def test_migrations_apply_in_order(self):
         with self.connection.cursor() as cursor:
@@ -418,8 +996,12 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 cursor.execute(
                     """
                     SELECT COUNT(*)
-                    FROM vrp.current_reference_rate_observations
-                    WHERE series_key = 'SOFR'
+                    FROM vrp.current_reference_rate_observations AS observation
+                    JOIN vrp.reference_data_releases AS release
+                      ON release.reference_data_release_id =
+                         observation.reference_data_release_id
+                    WHERE observation.series_key = 'SOFR'
+                      AND release.dataset_key = 'FRED_SOFR'
                     """
                 )
                 self.assertEqual(cursor.fetchone()[0], 4)
