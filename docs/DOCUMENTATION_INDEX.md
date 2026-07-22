@@ -5,6 +5,9 @@
 1. [`PRODUCTION_OPERATIONS.md`](PRODUCTION_OPERATIONS.md) — how the current completed-EOD system runs.
 2. [`CURRENT_STATUS_AND_ROADMAP.md`](CURRENT_STATUS_AND_ROADMAP.md) — what is finished and what comes next.
 3. [`MODEL_LOCK_AND_OPERATIONAL_SUPERSESSION.md`](MODEL_LOCK_AND_OPERATIONAL_SUPERSESSION.md) — precedence between the immutable model lock and later operational repairs.
+4. [`GOLDEN_EOD_CONTRACT.md`](GOLDEN_EOD_CONTRACT.md) — immutable examples that protect the accepted calculation contract.
+5. [`PRODUCTION_SOURCE_INVENTORY.md`](PRODUCTION_SOURCE_INVENTORY.md) — active components, local data, known coupling, and migration order.
+6. [`DATABASE_ARCHITECTURE.md`](DATABASE_ARCHITECTURE.md) — PostgreSQL operational schema and Parquet boundaries.
 
 ## Immutable model-lock records
 
@@ -23,7 +26,7 @@ The machine-readable model files live in `config/`, not `docs/`:
 
 When documents appear to conflict, use this order:
 
-1. Current code and regression tests on `main`.
+1. Current code, regression tests, and the golden EOD contract on `main`.
 2. `config/vrp_hybrid_v2_eod_runtime_config.json` for operational data-source and path contracts.
 3. The production-config and lock JSON files for locked signal, sizing, and selection parameters.
 4. `PRODUCTION_OPERATIONS.md` for operator instructions.

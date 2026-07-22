@@ -2,105 +2,104 @@
 
 ## Current status
 
-The production EOD audit repair is complete.
+The locked Hybrid v2 put-sleeve methodology and repaired completed-EOD calculation path are the accepted production baseline.
 
-- Repaired canonical history was published and accepted.
-- Forecast return features now use canonical SPY data with no SPX/generic fallback.
-- SOFR, early-close expiration clocks, Wilder RSI, and deterministic history updates were repaired.
-- Unsupported 2019 forecasts and premature 2020 decisions were removed.
-- Regression tests and production health checks pass.
-- The repair code was merged into `main`.
-- The July 20 implied-variance calendar bottleneck and incremental Wilder-RSI extension defect were repaired and validated in production.
+- Canonical history is current through 2026-07-21.
+- The July 2026 source, SOFR, expiration-clock, and Wilder-RSI repairs are accepted.
+- The existing EOD regression suite passes.
+- Baseline commit: `c3857984def9d295bd49dc7eab7c5a8421b0ed5b`.
+- Baseline tag: `eod-v2-production-baseline-2026-07-21`.
+- Golden EOD examples protect representative trade and no-trade decisions.
 
-The locked put-sleeve signal methodology should not be re-optimized merely because the repair changed historical results. Portfolio-level put sizing is intentionally deferred. The next workstream is exact replication of the existing 30D Excel short-call sleeve in Python.
+The current objective is to complete the production pipeline, intraday signal capability, and deployment before resuming other research.
 
-## 1. Finish the short-call sleeve
+## 1. Production foundation and deterministic EOD pipeline
 
-Use this sequence:
+This is the active workstream.
 
-1. Replicate the existing 30D Excel call sleeve exactly in Python.
-2. Reconcile Python-versus-Excel signal frequency.
-3. Validate SPY trade construction, holiday-aware expiration, 1-SD short / 3-SD long strikes, and held-to-expiration outcomes.
-4. Match the Excel-style `LN(VIX^2 / RV21D)` signal before changing the denominator.
-5. Replace RV21D with the locked Corsi forecast only after replication is trustworthy.
-6. Expand to 9-33 DTE.
-7. Keep initial 3-month and 1-year z-score thresholds equal during sweeps.
-8. Backtest the selection rule across multiple qualifying tenors.
-9. Determine call-sleeve sizing and caps.
+1. Preserve accepted production outputs as golden cases.
+2. Introduce stable `src/vrp/` package boundaries around the validated calculations.
+3. Keep one production entry point at `scripts/run_eod.py`.
+4. Add versioned PostgreSQL migrations for operational and signal data.
+5. Retain raw and standardized large market data as partitioned Parquet.
+6. Record every run, stage, data asset, model version, configuration version, QA result, and selected signal.
+7. Make reruns idempotent and failed stages restartable.
+8. Publish the latest signal only after every required stage passes.
+9. Remove runtime dependencies on archived notebooks and ignored generated source dumps one validated component at a time.
 
-## 2. Deferred put-sleeve portfolio sizing
+Completion requires:
 
-This remains useful future work, but it is not the current priority. Until it resumes, the existing per-trade sizing remains unchanged and aggregate exposure approval remains a manual risk decision.
+- one command rebuilds a complete EOD signal;
+- the golden dates reconcile within their locked tolerances;
+- stale or incomplete inputs cannot publish a valid signal;
+- every output carries data, code, model, and configuration lineage;
+- PostgreSQL holds operational outputs while Parquet retains large source datasets;
+- the latest result states either the selected trade or an explicit no-trade reason.
 
-Build and test portfolio-level controls for:
+## 2. Intraday signal engine
 
-- overlapping open trades;
-- aggregate max-loss exposure;
-- concentration by layer and tenor bucket;
-- rolling downside stress;
-- moderate and extreme SPY shock scenarios;
-- drawdown-sensitive scaling;
-- interaction between per-trade sizing and portfolio caps;
-- whether explicit hedges support more efficient gross exposure.
+Begin only after the EOD path is deterministic through the new production interfaces.
 
-The intended production rule is simple: allow the locked per-trade size unless portfolio overlap, concentration, or stress requires a haircut.
+Version 1 will run approximately every 15 minutes during market hours and operate in shadow mode.
 
-## 3. Combine put and call sleeves
+Updated intraday:
 
-After both sleeves are independently validated:
+- SPX/SPXW option quotes;
+- SPX spot;
+- implied-variance term structure;
+- VRP numerator;
+- preview qualification and tenor ranking;
+- an explicitly defined intraday RSI estimate.
 
-- permit one put and one call trade on the same date;
-- track combined downside and upside stress;
-- allocate risk by sleeve, layer, and tenor;
-- measure net beta, convexity, vega, and crash exposure;
-- test whether call premium materially offsets put stress;
-- define unified portfolio caps and hedge rules.
+Fixed from the prior official close:
 
-## 4. Extend the dashboard
+- Corsi forecast denominator;
+- historical three-month and one-year z-score distributions;
+- RV21D;
+- model parameters and signal thresholds.
 
-The completed-EOD dashboard already exists. Add the call sleeve only after its replication and research are validated. Portfolio-risk displays can wait until portfolio sizing resumes.
+Snapshots will distinguish `NO_SIGNAL`, `PREVIEW_SIGNAL`, `PREVIEW_SIGNAL_CHANGED`, `DATA_DEGRADED`, and `EOD_OFFICIAL`. No automatic order placement is in scope.
 
-Priority additions:
+Completion requires retained snapshots, quote-freshness and chain-quality assessments, one-query latest-signal retrieval, traceable signal changes, shared calculation code with EOD, and automatic last-snapshot-versus-official reconciliation.
 
-- open positions and aggregate risk;
-- overlap and concentration caps;
-- downside and upside stress results;
-- hedge status;
-- put/call sleeve attribution;
-- concise production alerts and last-successful-run status.
+## 3. Deployment and remote signal visibility
 
-Move to 15-minute intraday refresh only after the EOD system and portfolio layer are stable.
+Deploy only after intraday shadow mode is reliable locally.
 
-## 5. Production automation
+- Run collection, EOD, intraday scheduling, and QA without an open desktop session.
+- Use managed PostgreSQL for operational data and object storage for Parquet.
+- Keep credentials in a managed secret store, never in Git.
+- Record the deployed Git commit and configuration version.
+- Provide a secure phone-accessible latest-signal page.
+- Alert on new or materially changed signals, stale data, and failed runs.
+- Support manual reruns, backfills, backups, and rollback.
 
-Then add:
+The ThetaData access arrangement is the deployment gate: either collect directly on the deployment host or run a local collector that publishes standardized snapshots to cloud storage.
 
-- scheduled source refreshes;
-- orchestration and failure alerts;
-- data-quality alerts;
-- retained decision snapshots and run manifests;
-- remote, phone-accessible deployment.
+## 4. Dashboard
 
-Normal operation should rely on compact automated controls rather than large one-off audit packages.
+The completed-EOD Streamlit dashboard remains useful but is below the signal engine in priority. Calculation logic stays outside Streamlit.
 
-## 6. Later extensions
+After deployment, extend it with intraday-versus-official status, data freshness, QA state, threshold distances, signal history, and calculation traceability.
 
-Only after the SPY/SPX system is fully operational:
+## 5. Deferred research
 
-- test Corsi portability to QQQ and IWM;
-- build ticker-specific implied-variance histories;
-- compare absolute and relative VRP across ETFs;
-- research SPY-versus-QQQ relative-volatility trades;
-- evaluate additional hedge overlays.
+The following remain intentionally on the back burner until sections 1 through 3 are complete:
 
-## Recommended order
+- 30D Excel short-call replication;
+- forecast-VRP call research;
+- call-sleeve term-structure expansion;
+- combined put-and-call portfolio research;
+- portfolio overlap and sizing layers;
+- multi-ticker extensions.
+
+## Required order
 
 ```text
-Excel call-sleeve replication
-    -> Corsi call research
-    -> deferred put portfolio sizing and stress controls
-    -> unified put/call portfolio
-    -> dashboard risk expansion
-    -> automation
-    -> multi-ticker research
+Golden EOD contract
+    -> deterministic and traceable EOD production
+    -> 15-minute intraday shadow engine
+    -> remote deployment and alerts
+    -> dashboard expansion
+    -> deferred research
 ```
