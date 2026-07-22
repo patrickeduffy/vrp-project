@@ -9,6 +9,8 @@
 5. [`PRODUCTION_SOURCE_INVENTORY.md`](PRODUCTION_SOURCE_INVENTORY.md) — active components, local data, known coupling, and migration order.
 6. [`DATABASE_ARCHITECTURE.md`](DATABASE_ARCHITECTURE.md) — PostgreSQL operational schema and Parquet boundaries.
 
+7. [`REFERENCE_DATA_STORAGE.md`](REFERENCE_DATA_STORAGE.md) — compact SOFR/SPY history, units, formulas, and revision rules.
+
 ## Immutable model-lock records
 
 - [`VRP_Corsi_Intraday_Hybrid_v2_Model_Lock.docx`](VRP_Corsi_Intraday_Hybrid_v2_Model_Lock.docx)

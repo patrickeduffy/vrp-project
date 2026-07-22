@@ -1,0 +1,122 @@
+# Compact historical data in PostgreSQL
+
+## Purpose
+
+Migration `0002_reference_data.sql` adds the small daily histories needed by the
+EOD and future intraday signal engines. Full option chains and large research
+panels remain in Parquet.
+
+The first compact datasets are:
+
+| Dataset | PostgreSQL values | Canonical file remains |
+|---|---|---|
+| SOFR | observation date, source percentage rate, derived decimal rate | `data/external/fred_sofr_history.csv` |
+| SPY daily features | close, log return, Wilder RSI state, signal RV21D | the accepted SPY, RSI, and realized-volatility Parquet files |
+
+PostgreSQL does not replace those canonical files during the dual-write phase.
+It receives validated copies with file digests, formula versions, units, and
+pipeline lineage so the two paths can be reconciled before database publication
+becomes authoritative.
+
+## Source contracts
+
+### SOFR
+
+The FRED source column is in annual percentage points. A value of `3.57` means
+3.57 percent. PostgreSQL retains that exact source value as `rate_percent` and
+generates `rate_decimal = 0.0357` for calculations. EOD selection remains the
+latest available observation strictly before the valuation date.
+
+The normal FRED download is latest-revised history, not a true point-in-time
+vintage. Initial backfills must therefore use `LATEST_REVISED`. A source
+correction inserts a successor row; it never overwrites the earlier accepted
+observation.
+
+### SPY close and log return
+
+The canonical price file comes from ThetaData's SPY EOD `close` field. Existing
+documentation has sometimes called it adjusted, but the artifact does not carry
+an explicit adjustment flag. The first database definition must therefore use
+`price_adjustment = 'UNKNOWN'` and record the source field. It must not claim an
+adjustment convention until that convention is independently confirmed.
+
+The return is the decimal log return:
+
+```text
+ln(spy_close[t] / spy_close[t-1])
+```
+
+The first return in a bounded history can legitimately be null.
+
+### Wilder RSI14
+
+The accepted formula version is
+`wilder_rsi14_spy_close_v3_clean_session_rebuild`. The database retains RSI,
+Wilder average gain, and Wilder average loss so the accepted recursive state is
+not lost. The definition metadata must also retain the seed provenance and seed
+state digest. A migration must copy the accepted state; it must not invent a new
+seed from the currently retained price window.
+
+### Signal RV21D
+
+The signal input `rv21d_volatility_pct` is:
+
+```text
+rolling_std(spy_log_return, 21, ddof=1) * sqrt(252) * 100
+```
+
+It is annualized volatility in percentage points. It is distinct from
+`spy_vol_21d_pct`, which is derived from a rolling mean of squared returns.
+The database feature definition pins `window=21`, `ddof=1`, and
+`annualization_sessions=252` so the two series cannot be silently confused.
+Warm-up nulls remain null.
+
+## Revision and idempotency rules
+
+The four new tables are append-only:
+
+- `reference_data_releases` records each accepted normalized dataset version;
+- `reference_rate_observations` stores new or revised SOFR rows;
+- `daily_market_feature_definitions` pins formulas, units, and source semantics;
+- `daily_market_features` stores new or revised daily SPY feature rows.
+
+An unchanged normalized input has the same SHA-256 digest and reuses its release
+without inserting rows. A changed value inserts a row pointing to the value it
+supersedes. The `current_*` views select the unsuperseded leaf. Database triggers
+reject updates and deletes, preserving prior accepted values and published-run
+reproducibility.
+
+The loader runs under a dataset-scoped transaction lock. File registration,
+the release, its new rows, lineage, QA, and stage completion belong in one outer
+transaction; the storage adapter never commits independently. PostgreSQL stores
+the transaction ID on the release and its rows, which prevents additional rows
+from being attached after that release has committed.
+
+## Operational links
+
+During dual writing, the new foreign keys remain nullable. New database-backed
+runs can pin:
+
+- the exact SOFR observation used by a market snapshot; and
+- the exact official daily SPY feature row supplying prior-close context and
+  fixed RV21D.
+
+For EOD, QA also requires the copied RSI14 to match that daily row. An intraday
+preview may use a separately identified `INTRADAY_ESTIMATE` RSI14 and a live SPY
+price while continuing to pin RV21D to the prior official daily row.
+
+The duplicated values on immutable run outputs remain intentional. A later
+source correction changes the current reference view but cannot change what an
+already published run used.
+
+## Development setup
+
+No local PostgreSQL installation is required for this migration stage. GitHub
+Actions starts a disposable PostgreSQL service, applies migrations `0001` and
+`0002`, verifies correction behavior, and confirms the append-only trigger.
+
+Local PostgreSQL will be introduced when the historical loader and EOD dual
+write need end-to-end testing against the production data files. Application
+connections use `VRP_DATABASE_URL`; production or durable credentials must
+never be committed or placed on command lines. The password in CI belongs only
+to its disposable test container.
