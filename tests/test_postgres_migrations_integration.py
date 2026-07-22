@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 from uuid import uuid4
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +26,9 @@ else:  # pragma: no cover - ordinary local run without PostgreSQL
     psycopg = None
 
 from vrp.storage.postgres import PostgresReferenceDataRepository
+from vrp.reference_history.artifacts import ContentAddressedArtifactStore, prepare_history
+from vrp.reference_history.service import execute_reference_history_load
+from vrp.reference_history.sources import normalize_sofr_csv, normalize_spy_daily_frames
 from vrp.storage.reference_data import (
     DailyMarketFeature,
     DailyMarketFeatureDefinition,
@@ -32,6 +38,15 @@ from vrp.storage.reference_data import (
     StoredReferenceRateObservation,
     daily_market_feature_definition_sha256,
 )
+from tests.test_reference_history_normalization import synthetic_spy_frames
+
+
+def local_path_from_file_uri(uri: str) -> Path:
+    parsed = urlparse(uri)
+    path = Path(url2pathname(parsed.path))
+    if parsed.netloc:
+        return Path(f"//{parsed.netloc}{url2pathname(parsed.path)}")
+    return path
 
 
 @unittest.skipUnless(TEST_DSN, "VRP test PostgreSQL is not configured")
@@ -141,6 +156,331 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         with self.connection.cursor() as cursor:
             cursor.execute("SELECT version FROM vrp.schema_migrations ORDER BY version")
             self.assertEqual([row[0] for row in cursor.fetchall()], ["0001", "0002"])
+
+    def test_historical_loader_is_idempotent_revision_safe_and_atomic(self):
+        def prepared_sofr(store, source, rows):
+            source.write_text(
+                "observation_date,SOFR\n"
+                + "".join(f"{day},{value}\n" for day, value in rows),
+                encoding="utf-8",
+            )
+            frozen = store.freeze_inputs({"sofr": source})
+            history = normalize_sofr_csv(
+                frozen.inputs["sofr"].path,
+                enforce_production_coverage=False,
+            )
+            return prepare_history(history, frozen_inputs=frozen, store=store)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ContentAddressedArtifactStore(root / "artifacts")
+            source = root / "sofr.csv"
+            first = prepared_sofr(
+                store,
+                source,
+                (("2018-04-03", "1.83"), ("2018-04-04", "1.74")),
+            )
+            with psycopg.connect(TEST_DSN) as loader_connection:
+                first_result = execute_reference_history_load(
+                    loader_connection,
+                    first,
+                    artifact_store=store,
+                    environment="integration-test",
+                    code_version="integration-test-v1",
+                )
+                first_rerun = execute_reference_history_load(
+                    loader_connection,
+                    first,
+                    artifact_store=store,
+                    environment="integration-test",
+                    code_version="integration-test-v1",
+                )
+                self.assertTrue(first_rerun.no_op)
+                self.assertEqual(
+                    first_result.reference_data_release_id,
+                    first_rerun.reference_data_release_id,
+                )
+
+                second = prepared_sofr(
+                    store,
+                    source,
+                    (
+                        ("2018-04-03", "1.83"),
+                        ("2018-04-04", "1.75"),
+                        ("2018-04-05", "1.75"),
+                    ),
+                )
+                second_result = execute_reference_history_load(
+                    loader_connection,
+                    second,
+                    artifact_store=store,
+                    environment="integration-test",
+                    code_version="integration-test-v1",
+                )
+                self.assertEqual(second_result.new_count, 1)
+                self.assertEqual(second_result.correction_count, 1)
+
+                old_after_advance = execute_reference_history_load(
+                    loader_connection,
+                    first,
+                    artifact_store=store,
+                    environment="integration-test",
+                    code_version="integration-test-v1",
+                )
+                self.assertTrue(old_after_advance.no_op)
+
+                reverified_old_release = execute_reference_history_load(
+                    loader_connection,
+                    first,
+                    artifact_store=store,
+                    environment="integration-test",
+                    code_version="integration-test-v2",
+                )
+                self.assertTrue(reverified_old_release.no_op)
+                self.assertNotEqual(
+                    reverified_old_release.pipeline_run_id,
+                    first_result.pipeline_run_id,
+                )
+                self.assertEqual(
+                    reverified_old_release.reference_data_release_id,
+                    first_result.reference_data_release_id,
+                )
+
+                with self.connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT asset.storage_uri
+                        FROM vrp.pipeline_run_data_assets AS link
+                        JOIN vrp.data_assets AS asset
+                          ON asset.data_asset_id = link.data_asset_id
+                        WHERE link.pipeline_run_id = %s
+                          AND link.usage_role = 'QA_EVIDENCE'
+                          AND link.logical_name = 'reference_history_qa_manifest'
+                        """,
+                        (reverified_old_release.pipeline_run_id,),
+                    )
+                    reverified_qa_path = local_path_from_file_uri(cursor.fetchone()[0])
+                reverified_qa_bytes = reverified_qa_path.read_bytes()
+                try:
+                    reverified_qa_path.write_bytes(reverified_qa_bytes + b"\n")
+                    with self.assertRaisesRegex(RuntimeError, "persisted artifact size"):
+                        execute_reference_history_load(
+                            loader_connection,
+                            first,
+                            artifact_store=store,
+                            environment="integration-test",
+                            code_version="integration-test-v2",
+                        )
+                finally:
+                    reverified_qa_path.write_bytes(reverified_qa_bytes)
+
+                equivalent_source = prepared_sofr(
+                    store,
+                    source,
+                    (("2018-04-03", "1.830"), ("2018-04-04", "1.740")),
+                )
+                self.assertEqual(
+                    equivalent_source.normalized.content_sha256,
+                    first.normalized.content_sha256,
+                )
+                equivalent_result = execute_reference_history_load(
+                    loader_connection,
+                    equivalent_source,
+                    artifact_store=store,
+                    environment="integration-test",
+                    code_version="integration-test-v3",
+                )
+                self.assertEqual(
+                    equivalent_result.reference_data_release_id,
+                    first_result.reference_data_release_id,
+                )
+                original_input_path = first.source_artifacts[0].path
+                original_input_bytes = original_input_path.read_bytes()
+                try:
+                    original_input_path.write_bytes(original_input_bytes + b"\n")
+                    with self.assertRaisesRegex(RuntimeError, "persisted artifact size"):
+                        execute_reference_history_load(
+                            loader_connection,
+                            equivalent_source,
+                            artifact_store=store,
+                            environment="integration-test",
+                            code_version="integration-test-v3",
+                        )
+                finally:
+                    original_input_path.write_bytes(original_input_bytes)
+
+                third = prepared_sofr(
+                    store,
+                    source,
+                    (
+                        ("2018-04-03", "1.83"),
+                        ("2018-04-04", "1.75"),
+                        ("2018-04-05", "1.75"),
+                        ("2018-04-06", "1.76"),
+                    ),
+                )
+
+                def fail_after_rows(stage):
+                    if stage == "after_release_rows":
+                        raise RuntimeError("intentional rollback test")
+
+                with self.assertRaisesRegex(RuntimeError, "intentional rollback"):
+                    execute_reference_history_load(
+                        loader_connection,
+                        third,
+                        artifact_store=store,
+                        environment="integration-test",
+                        code_version="integration-test-v1",
+                        failure_injector=fail_after_rows,
+                    )
+
+                with self.connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM vrp.reference_data_releases
+                        WHERE normalized_content_sha256 = %s
+                        """,
+                        (third.normalized.content_sha256,),
+                    )
+                    self.assertEqual(cursor.fetchone()[0], 0)
+                    cursor.execute(
+                        """
+                        SELECT run.pipeline_run_id, run.status, run.qa_status,
+                               stage.status, qa.outcome,
+                               (
+                                   SELECT COUNT(*)
+                                   FROM vrp.pipeline_run_data_assets AS link
+                                   WHERE link.pipeline_run_id = run.pipeline_run_id
+                               )
+                        FROM vrp.pipeline_runs AS run
+                        JOIN vrp.pipeline_run_stages AS stage
+                          ON stage.pipeline_run_id = run.pipeline_run_id
+                        JOIN vrp.qa_results AS qa
+                          ON qa.pipeline_run_id = run.pipeline_run_id
+                        WHERE run.environment = 'integration-test'
+                          AND run.invocation->>'normalized_content_sha256' = %s
+                        """,
+                        (third.normalized.content_sha256,),
+                    )
+                    failed_run = cursor.fetchone()
+                    self.assertEqual(failed_run[1:], ("FAILED", "FAIL", "FAILED", "FAIL", 0))
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*)
+                        FROM vrp.data_assets
+                        WHERE dataset_name = 'FRED_SOFR_NORMALIZED'
+                          AND content_sha256 = %s
+                        """,
+                        (third.normalized.content_sha256,),
+                    )
+                    self.assertEqual(cursor.fetchone()[0], 0)
+
+                third_result = execute_reference_history_load(
+                    loader_connection,
+                    third,
+                    artifact_store=store,
+                    environment="integration-test",
+                    code_version="integration-test-v1",
+                )
+                self.assertFalse(third_result.no_op)
+                with self.connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT run.status, run.qa_status, stage.status,
+                               stage.attempt_count, qa.outcome
+                        FROM vrp.pipeline_runs AS run
+                        JOIN vrp.pipeline_run_stages AS stage
+                          ON stage.pipeline_run_id = run.pipeline_run_id
+                        JOIN vrp.qa_results AS qa
+                          ON qa.pipeline_run_id = run.pipeline_run_id
+                        WHERE run.pipeline_run_id = %s
+                        """,
+                        (third_result.pipeline_run_id,),
+                    )
+                    self.assertEqual(
+                        cursor.fetchone(),
+                        ("COMPLETED", "PASS", "COMPLETED", 2, "PASS"),
+                    )
+
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT run.status, run.qa_status, qa.outcome
+                    FROM vrp.pipeline_runs AS run
+                    JOIN vrp.qa_results AS qa
+                      ON qa.pipeline_run_id = run.pipeline_run_id
+                    WHERE run.pipeline_run_id = %s
+                    """,
+                    (first_result.pipeline_run_id,),
+                )
+                self.assertEqual(cursor.fetchone(), ("COMPLETED", "PASS", "PASS"))
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM vrp.current_reference_rate_observations
+                    WHERE series_key = 'SOFR'
+                    """
+                )
+                self.assertEqual(cursor.fetchone()[0], 4)
+                cursor.execute(
+                    """
+                    SELECT asset.storage_uri
+                    FROM vrp.reference_data_releases AS release
+                    JOIN vrp.data_assets AS asset
+                      ON asset.data_asset_id = release.qa_manifest_data_asset_id
+                    WHERE release.reference_data_release_id = %s
+                    """,
+                    (third_result.reference_data_release_id,),
+                )
+                qa_uri = cursor.fetchone()[0]
+            qa_path = local_path_from_file_uri(qa_uri)
+            qa_text = qa_path.read_text(encoding="utf-8")
+            self.assertNotIn("PENDING", qa_text)
+            self.assertIn('"current_rows_match_candidate_at_commit":"PASS"', qa_text)
+
+    def test_historical_loader_persists_daily_feature_definition_and_rows(self):
+        import pandas as pd
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ContentAddressedArtifactStore(root / "artifacts")
+            prices, rsi, realized = synthetic_spy_frames()
+            sources = {
+                "spy_eod": root / "spy_eod.csv",
+                "wilder_rsi": root / "wilder_rsi.csv",
+                "rv21d": root / "rv21d.csv",
+            }
+            prices.to_csv(sources["spy_eod"], index=False)
+            rsi.to_csv(sources["wilder_rsi"], index=False)
+            realized.to_csv(sources["rv21d"], index=False)
+            frozen = store.freeze_inputs(sources)
+            history = normalize_spy_daily_frames(
+                pd.read_csv(frozen.inputs["spy_eod"].path),
+                pd.read_csv(frozen.inputs["wilder_rsi"].path),
+                pd.read_csv(frozen.inputs["rv21d"].path),
+                enforce_production_coverage=False,
+            )
+            prepared = prepare_history(history, frozen_inputs=frozen, store=store)
+            with psycopg.connect(TEST_DSN) as loader_connection:
+                result = execute_reference_history_load(
+                    loader_connection,
+                    prepared,
+                    artifact_store=store,
+                    environment="integration-test-daily",
+                    code_version="integration-test-v1",
+                )
+            self.assertEqual(result.persisted_row_count, 25)
+            with self.connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*), COUNT(DISTINCT daily_market_feature_definition_id)
+                    FROM vrp.daily_market_features
+                    WHERE reference_data_release_id = %s
+                    """,
+                    (result.reference_data_release_id,),
+                )
+                self.assertEqual(cursor.fetchone(), (25, 1))
 
     def test_repository_revisions_and_operational_links(self):
         sofr_asset_id = self._insert_asset("test_sofr", "1")
