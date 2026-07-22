@@ -46,10 +46,12 @@ python -m pip install -r requirements.txt
 From `C:\Users\patri\vrp_project`:
 
 ```powershell
-python -u notebooks\vrp_hybrid_v2_eod_pipeline.py `
+python scripts\run_eod.py `
   --project-root C:\Users\patri\vrp_project `
   --approved-nav 1000000
 ```
+
+The stable command delegates to the accepted EOD orchestrator. Use `--dry-run` to inspect the delegated command without executing it.
 
 The default target is the latest completed XNYS session after the configured close buffer.
 
@@ -86,6 +88,17 @@ python notebooks\vrp_hybrid_v2_health_check.py `
 ```
 
 A production-ready result requires `OVERALL_STATUS: PASS` and zero hard failures.
+
+## Golden reconciliation
+
+After structural calculation or storage changes, reconcile the accepted historical examples:
+
+```powershell
+python scripts\golden_eod.py verify `
+  --source-root C:\Users\patri\vrp_project
+```
+
+A production-ready result requires `GOLDEN_STATUS: PASS`. Routine daily history extensions do not require recapturing the fixture.
 
 ## Dashboard
 
@@ -126,7 +139,7 @@ Repair lineage and acceptance records are also stored there and referenced by th
 5. Use `--no-publish` for a repair trial.
 6. Require tests and health to pass before publishing or merging a production fix.
 
-The pipeline is designed to publish atomically after hard validation. A failed run should leave the last healthy canonical set intact or restore it from the run backup.
+The current file pipeline stages outputs and retains a backup for rollback, but it replaces the canonical files sequentially and performs final health checks afterward. It is recoverable, not transactionally atomic to concurrent readers. Do not treat the dashboard as stable while publication is in progress. The planned PostgreSQL publication record will become the true atomic visibility boundary; until then, a failed run should restore the last healthy canonical set from the run backup.
 
 ## Change control
 

@@ -31,6 +31,8 @@ The accepted repair baseline is through 2026-07-16. Normal production runs advan
 
 ## Active production entry points
 
+- `scripts/run_eod.py` — stable production-facing EOD entry point
+- `scripts/golden_eod.py` — golden-output capture and reconciliation
 - `notebooks/vrp_hybrid_v2_eod_pipeline.py` — EOD orchestrator
 - `notebooks/vrp_hybrid_v2_signal_publish.py` — locked signal, sizing, and selection logic
 - `notebooks/vrp_hybrid_v2_health_check.py` — production data and contract validation
@@ -44,10 +46,12 @@ The accepted repair baseline is through 2026-07-16. Normal production runs advan
 From the repository root:
 
 ```powershell
-python -u notebooks\vrp_hybrid_v2_eod_pipeline.py `
+python scripts\run_eod.py `
   --project-root C:\Users\patri\vrp_project `
   --approved-nav 1000000
 ```
+
+The stable entry point currently delegates to the accepted notebook-era orchestrator. This preserves the locked calculations while production modules are migrated incrementally. Add `--dry-run` to inspect the delegated command without executing it.
 
 Useful diagnostic options:
 
@@ -67,6 +71,16 @@ python notebooks\vrp_hybrid_v2_health_check.py `
 
 Omit `--no-thetadata-probe` when ThetaData connectivity should be tested.
 
+## Run regression and golden checks
+
+```powershell
+python -m unittest discover -s tests -v
+python scripts\golden_eod.py verify `
+  --source-root C:\Users\patri\vrp_project
+```
+
+The ordinary regression suite runs in code-only checkouts. Its production-data reconciliation test runs automatically when canonical data is present or when `VRP_GOLDEN_SOURCE_ROOT` points to the production checkout.
+
 ## Launch the dashboard
 
 On the production computer, run `START VRP HYBRID V2.bat`. The equivalent direct command is:
@@ -78,8 +92,11 @@ python -m streamlit run notebooks\streamlit_vrp_hybrid_v2_eod.py
 ## Repository layout
 
 - `config/` — active model and runtime configuration
+- `src/vrp/` — stable production package interfaces
+- `scripts/` — production and administrative command-line entry points
+- `migrations/` — versioned PostgreSQL operational schema
 - `notebooks/` — active production Python entry points and current research
-- `tests/` — regression tests for production contracts
+- `tests/` — regression and golden tests for production contracts
 - `docs/` — active documentation and immutable model-lock records
 - `data/` — local-only market data, generated outputs, and audit records; excluded from Git
 - `old/` — retained historical code, superseded repairs, and abandoned experiments; see `old/ARCHIVE_INDEX.md`
@@ -98,12 +115,14 @@ The repository intentionally excludes:
 
 These remain on the production computer and are covered by `.gitignore`.
 
+The planned storage boundary is Parquet for immutable raw and standardized market data, PostgreSQL for operational state and published signal outputs, and DuckDB for research queries over Parquet. See [`docs/DATABASE_ARCHITECTURE.md`](docs/DATABASE_ARCHITECTURE.md).
+
 ## Documentation
 
 Start with [`docs/DOCUMENTATION_INDEX.md`](docs/DOCUMENTATION_INDEX.md).
 
 The model-lock DOCX is immutable. Current operations are documented separately so that operational repairs do not alter the historical model-lock artifact.
 
-## Current research priority
+## Current development priority
 
-Put-sleeve portfolio sizing is intentionally deferred. The next primary workstream is exact Python replication of the existing 30D Excel short-call sleeve before testing a Corsi denominator or additional tenors. See [`docs/CURRENT_STATUS_AND_ROADMAP.md`](docs/CURRENT_STATUS_AND_ROADMAP.md).
+The active sequence is deterministic EOD production, 15-minute intraday shadow signals, and remote deployment. The short-call sleeve, combined portfolio research, and larger dashboard expansion are deferred until those three stages are complete. See [`docs/CURRENT_STATUS_AND_ROADMAP.md`](docs/CURRENT_STATUS_AND_ROADMAP.md).
