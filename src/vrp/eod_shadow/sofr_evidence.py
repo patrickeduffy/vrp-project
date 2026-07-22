@@ -118,16 +118,55 @@ def _resolve_updater_manifest(run_manifest: Mapping[str, Any]) -> Path:
 
 
 def _validate_updater_manifest(payload: Mapping[str, Any], manifest_path: Path) -> None:
-    required = {
-        "status": "PUBLISHED",
-        "published": True,
+    common_required = {
         "hard_checks_passed": True,
         "source": "FRED_SOFR",
     }
-    for field, expected in required.items():
+    for field, expected in common_required.items():
         observed = payload.get(field)
         if type(observed) is not type(expected) or observed != expected:
             _fail(f"SOFR updater manifest {field} must be {expected!r}")
+
+    status = payload.get("status")
+    if type(status) is not str or status not in {"PUBLISHED", "NO_CHANGE"}:
+        _fail("SOFR updater manifest status must be 'PUBLISHED' or 'NO_CHANGE'")
+
+    rows_added = payload.get("rows_added")
+    rows_revised = payload.get("rows_revised")
+    for field, observed in (
+        ("rows_added", rows_added),
+        ("rows_revised", rows_revised),
+    ):
+        if type(observed) is not int or observed < 0:
+            _fail(f"SOFR updater manifest {field} must be a non-negative integer")
+
+    state_required = (
+        {
+            "published": True,
+            "changes_detected": True,
+        }
+        if status == "PUBLISHED"
+        else {
+            "published": False,
+            "changes_detected": False,
+        }
+    )
+    for field, expected in state_required.items():
+        observed = payload.get(field)
+        if type(observed) is not bool or observed is not expected:
+            _fail(f"SOFR updater manifest {field} must be {expected!r}")
+
+    changed_row_count = rows_added + rows_revised
+    if status == "PUBLISHED" and changed_row_count == 0:
+        _fail(
+            "SOFR updater manifest PUBLISHED status requires at least one "
+            "added or revised row"
+        )
+    if status == "NO_CHANGE" and changed_row_count != 0:
+        _fail(
+            "SOFR updater manifest NO_CHANGE status requires rows_added=0 and "
+            "rows_revised=0"
+        )
 
     run_timestamp = _required_text(
         payload.get("run_timestamp_utc"),
