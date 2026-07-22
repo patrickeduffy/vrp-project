@@ -517,14 +517,15 @@ class EodPostgresRepositoryTests(unittest.TestCase):
     def test_projection_and_finalize_are_bound_and_transaction_neutral(self):
         run_id = uuid4()
         projection = {"run": {"pipeline_run_id": str(run_id)}, "signal_features": []}
-        cursor = RecordingCursor(responses=[(projection,), (run_id,)])
+        cursor = RecordingCursor(responses=[None, (projection,), (run_id,)])
         repository = PostgresEodRepository(cursor)
         self.assertEqual(repository.fetch_run_projection(run_id), projection)
         repository.finalize_run(run_id)
-        self.assertEqual(cursor.calls[0][1], (run_id,))
+        self.assertEqual(cursor.calls[0], ("SET LOCAL TIME ZONE 'UTC'", None))
         self.assertEqual(cursor.calls[1][1], (run_id,))
-        self.assertIn("COUNT(*)", cursor.calls[1][0])
-        self.assertNotIn(str(run_id), cursor.calls[0][0])
+        self.assertEqual(cursor.calls[2][1], (run_id,))
+        self.assertIn("COUNT(*)", cursor.calls[2][0])
+        self.assertNotIn(str(run_id), cursor.calls[1][0])
         self.assertEqual(cursor.connection.commit_count, 0)
         self.assertEqual(cursor.connection.rollback_count, 0)
 
