@@ -33,6 +33,7 @@ The accepted repair baseline is through 2026-07-16. Normal production runs advan
 
 - `scripts/run_eod.py` — stable production-facing EOD entry point
 - `scripts/golden_eod.py` — golden-output capture and reconciliation
+- `scripts/load_reference_history.py` — validated, revision-safe SOFR/SPY historical backfill
 - `notebooks/vrp_hybrid_v2_eod_pipeline.py` — EOD orchestrator
 - `notebooks/vrp_hybrid_v2_signal_publish.py` — locked signal, sizing, and selection logic
 - `notebooks/vrp_hybrid_v2_health_check.py` — production data and contract validation
@@ -80,6 +81,20 @@ python scripts\golden_eod.py verify `
 ```
 
 The ordinary regression suite runs in code-only checkouts. Its production-data reconciliation test runs automatically when canonical data is present or when `VRP_GOLDEN_SOURCE_ROOT` points to the production checkout.
+
+## Validate compact reference history
+
+This command checks the complete SOFR, SPY close/return, Wilder RSI14, and signal
+RV21D histories without writing files or requiring PostgreSQL:
+
+```powershell
+python scripts\load_reference_history.py all `
+  --project-root C:\Users\patri\vrp_project `
+  --validate-only
+```
+
+Database loading is a separate, explicit step documented in
+[`docs/REFERENCE_DATA_STORAGE.md`](docs/REFERENCE_DATA_STORAGE.md).
 
 ## Launch the dashboard
 

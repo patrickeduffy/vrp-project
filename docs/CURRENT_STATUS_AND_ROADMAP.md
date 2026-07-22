@@ -17,6 +17,18 @@ The current objective is to complete the production pipeline, intraday signal ca
 
 This is the active workstream.
 
+Completed foundation increments:
+
+- the stable production entry point and golden-output contract;
+- PostgreSQL migration `0001` for operational runs, QA, signals, and publication;
+- PostgreSQL migration `0002` for revision-safe SOFR and SPY daily history;
+- deterministic historical normalization and backfill interfaces for SOFR,
+  SPY close/log return, Wilder RSI14 state, and signal RV21D.
+
+The next gate after the historical-loader PR is accepted is a durable database
+target plus EOD dual-write reconciliation. PostgreSQL does not become the
+authoritative calculation source until that comparison passes.
+
 1. Preserve accepted production outputs as golden cases.
 2. Introduce stable `src/vrp/` package boundaries around the validated calculations.
 3. Keep one production entry point at `scripts/run_eod.py`.
@@ -25,7 +37,8 @@ This is the active workstream.
    - `0002`: compact revision-safe SOFR and SPY close/return/RSI14/RV21D history.
 5. Retain raw and standardized large market data as partitioned Parquet.
 6. Record every run, stage, data asset, model version, configuration version, QA result, and selected signal.
-7. Make reruns idempotent and failed stages restartable.
+7. Make reruns idempotent and failed stages restartable. The reference-history
+   loader now satisfies this; the complete EOD orchestrator still must adopt it.
 8. Publish the latest signal only after every required stage passes.
 9. Remove runtime dependencies on archived notebooks and ignored generated source dumps one validated component at a time.
 

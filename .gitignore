@@ -36,6 +36,7 @@ data/interim/
 data/processed/
 data/audit/
 data/cache/
+data/reference_history/
 outputs/
 artifacts/
 logs/
@@ -71,6 +72,7 @@ Thumbs.db
 **/data/processed/
 **/data/audit/
 **/data/cache/
+**/data/reference_history/
 **/data/external/
 **/data/production/
 

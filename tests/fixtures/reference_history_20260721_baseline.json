@@ -1,0 +1,40 @@
+{
+  "as_of_date": "2026-07-21",
+  "datasets": {
+    "sofr": {
+      "end_date": "2026-07-20",
+      "latest_rate_percent": 3.57,
+      "normalized_content_sha256": "7df1c5c9e25f4bc2434a37f7eac182622df0273c4841c5164db158989b9369f6",
+      "path": "data/external/fred_sofr_history.csv",
+      "row_count": 2071,
+      "sha256": "c9edc16a6c6879d520d1b8f16a9595ef1232c0b6d6177b82d6f672071407c863",
+      "start_date": "2018-04-03"
+    },
+    "spy_eod": {
+      "end_date": "2026-07-21",
+      "feature_definition_content_sha256": "71854988797daedd685fa8d9a140fdcbd8dddaa8c2d7cd1c59c23e7f97a0371d",
+      "latest_spy_close": 748.32,
+      "normalized_content_sha256": "be60c8ef8aa846cec5b1e134d543d1f9fc2276da2983479011c2cffc8a953c6f",
+      "path": "data/processed/market_data/spy_eod_prices_v1.parquet",
+      "row_count": 2148,
+      "sha256": "17bf27294580ff4b95dbe8ffaabef9f08e1c6ff4f3b53997df0148d5fa62b87c",
+      "start_date": "2018-01-02"
+    },
+    "spy_rsi14": {
+      "formula_version": "wilder_rsi14_spy_close_v3_clean_session_rebuild",
+      "latest_rsi14": 52.487359683942614,
+      "path": "data/processed/market_data/spy_wilder_rsi14_history_v1.parquet",
+      "row_count": 2148,
+      "sha256": "c76387759951c3da84666c1c3dfbc387ff7f14e26b7759cc4162e2c7e0630ddb"
+    },
+    "spy_rv21d": {
+      "latest_volatility_pct": 11.746021142005407,
+      "path": "data/processed/market_data/spy_realized_vol_history_v1.parquet",
+      "row_count": 2148,
+      "sha256": "e99a0f3764d45a128cad47841ecacd4c6340544da522f7178a6f2499cea5fe78",
+      "source_column": "rv21d_vol_pct",
+      "warmup_row_count": 21
+    }
+  },
+  "fixture_schema": "vrp-reference-history-acceptance-v1"
+}

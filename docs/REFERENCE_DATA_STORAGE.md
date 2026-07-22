@@ -92,6 +92,49 @@ transaction; the storage adapter never commits independently. PostgreSQL stores
 the transaction ID on the release and its rows, which prevents additional rows
 from being attached after that release has committed.
 
+## Historical loader
+
+`scripts/load_reference_history.py` is the production-facing backfill command.
+It freezes the exact source bytes before reading them, validates the locked
+formulas, writes content-addressed evidence, and then publishes the run, assets,
+release, new or corrected rows, and QA result in one PostgreSQL transaction.
+It never publishes a trade signal.
+
+Validate the current files without writing anything or connecting to a database:
+
+```powershell
+python scripts\load_reference_history.py all `
+  --project-root C:\Users\patri\vrp_project `
+  --validate-only
+```
+
+After a PostgreSQL target has migrations `0001` and `0002` and
+`VRP_DATABASE_URL` is configured, load both histories with:
+
+```powershell
+python scripts\load_reference_history.py all `
+  --project-root C:\Users\patri\vrp_project `
+  --environment local
+```
+
+Safety properties:
+
+- the accepted SOFR history must begin on 2018-04-03;
+- the accepted SPY history must begin on 2018-01-02 and exactly match XNYS
+  sessions through its end date;
+- SPY, RSI, and RV files must have identical dates and closes;
+- bad numeric text cannot be converted into a warm-up null;
+- the RSI formula version, recursive state, returns, and signal RV21D are
+  recalculated and reconciled before any database write;
+- a repeated invocation is a no-op, while a correction adds a successor row;
+- an older completed release remains reproducible after a newer correction;
+- a failed publication rolls back every data row and records a failed run;
+- credentials come only from `VRP_DATABASE_URL`, never a command argument.
+
+The pinned July 21 source acceptance record lives at
+`tests/fixtures/reference_history_20260721_baseline.json`. It preserves source
+digests, row counts, date coverage, and latest accepted values for review.
+
 ## Operational links
 
 During dual writing, the new foreign keys remain nullable. New database-backed
@@ -111,12 +154,12 @@ already published run used.
 
 ## Development setup
 
-No local PostgreSQL installation is required for this migration stage. GitHub
-Actions starts a disposable PostgreSQL service, applies migrations `0001` and
-`0002`, verifies correction behavior, and confirms the append-only trigger.
+No local PostgreSQL installation is required to validate the files or review
+this stage. GitHub Actions starts a disposable PostgreSQL 17 service, applies
+migrations `0001` and `0002`, exercises initial load, identical rerun,
+correction, rollback, and retry behavior, and confirms the append-only trigger.
 
-Local PostgreSQL will be introduced when the historical loader and EOD dual
-write need end-to-end testing against the production data files. Application
-connections use `VRP_DATABASE_URL`; production or durable credentials must
-never be committed or placed on command lines. The password in CI belongs only
-to its disposable test container.
+A durable PostgreSQL target will be introduced for the EOD dual-write stage.
+Application connections use `VRP_DATABASE_URL`; production or durable
+credentials must never be committed or placed on command lines. The password in
+CI belongs only to its disposable test container.
