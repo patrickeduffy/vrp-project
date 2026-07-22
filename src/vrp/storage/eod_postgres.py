@@ -1076,6 +1076,11 @@ class PostgresEodRepository:
     def fetch_run_projection(self, pipeline_run_id: UUID) -> Mapping[str, Any]:
         """Return one stable, ordered JSON projection for read-back reconciliation."""
 
+        # PostgreSQL renders timestamptz values inside JSON using the session's
+        # TimeZone.  Keep the projection byte-stable across developer machines
+        # and deployed environments without changing the session after the
+        # caller-owned transaction ends.
+        self.cursor.execute("SET LOCAL TIME ZONE 'UTC'")
         self.cursor.execute(
             """
             SELECT jsonb_build_object(

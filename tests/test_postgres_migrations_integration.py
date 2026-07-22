@@ -574,6 +574,13 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
             self._seed_eod_reference_pins(snapshot.valuation_date)
 
             with psycopg.connect(TEST_DSN) as eod_connection:
+                # Match a common developer setup where PostgreSQL inherits a
+                # local US/Eastern session timezone.  Read-back reconciliation
+                # must still compare canonical UTC timestamps.
+                with eod_connection.cursor() as cursor:
+                    cursor.execute("SET SESSION TIME ZONE 'America/New_York'")
+                eod_connection.commit()
+
                 first = execute_eod_shadow_load(
                     eod_connection,
                     snapshot,
@@ -586,6 +593,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 self.assertEqual(first.forecast_variance_count, 9)
                 self.assertEqual(first.signal_feature_count, 9)
                 self.assertEqual(first.signal_evaluation_count, 18)
+                with eod_connection.cursor() as cursor:
+                    cursor.execute("SHOW TimeZone")
+                    self.assertEqual(cursor.fetchone()[0], "America/New_York")
+                eod_connection.rollback()
 
                 with self.connection.cursor() as cursor:
                     cursor.execute(
@@ -658,6 +669,10 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                 self.assertEqual(repeated.pipeline_run_id, first.pipeline_run_id)
                 self.assertEqual(repeated.market_snapshot_id, first.market_snapshot_id)
                 self.assertEqual(repeated.selected_signal_id, first.selected_signal_id)
+                with eod_connection.cursor() as cursor:
+                    cursor.execute("SHOW TimeZone")
+                    self.assertEqual(cursor.fetchone()[0], "America/New_York")
+                eod_connection.rollback()
 
                 with self.assertRaisesRegex(
                     RuntimeError, "injected EOD reconciliation failure"
