@@ -21,6 +21,8 @@ This is the active workstream.
 2. Introduce stable `src/vrp/` package boundaries around the validated calculations.
 3. Keep one production entry point at `scripts/run_eod.py`.
 4. Add versioned PostgreSQL migrations for operational and signal data.
+   - `0001`: operational run, QA, signal, and publication schema.
+   - `0002`: compact revision-safe SOFR and SPY close/return/RSI14/RV21D history.
 5. Retain raw and standardized large market data as partitioned Parquet.
 6. Record every run, stage, data asset, model version, configuration version, QA result, and selected signal.
 7. Make reruns idempotent and failed stages restartable.

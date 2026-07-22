@@ -10,7 +10,7 @@ The production data layer uses three complementary components:
 
 This split keeps high-volume quote data inexpensive and portable while giving the production pipeline transactional publication, constraints, and fast latest-signal queries. TimescaleDB is intentionally deferred until measured intraday volume demonstrates a need for it.
 
-The initial schema is defined by [`migrations/0001_operational_schema.sql`](../migrations/0001_operational_schema.sql). It uses only built-in PostgreSQL types and features. The application must supply UUID values; no UUID extension is required.
+The operational schema begins in [`migrations/0001_operational_schema.sql`](../migrations/0001_operational_schema.sql). Compact revision-safe SOFR and SPY daily history is added by [`migrations/0002_reference_data.sql`](../migrations/0002_reference_data.sql). Both use only built-in PostgreSQL types and features. The application must supply UUID values; no UUID extension is required.
 
 ## Data flow
 
@@ -51,6 +51,10 @@ All objects live in the `vrp` schema.
 | `pipeline_run_stages` | Restart checkpoints, attempt counts, fingerprints, errors, and stage metrics. |
 | `data_assets` | Content-addressed manifests for Parquet and other persisted artifacts. |
 | `pipeline_run_data_assets` | Input, output, intermediate, manifest, and QA-evidence lineage. |
+| `reference_data_releases` | Immutable accepted versions of normalized compact historical datasets. |
+| `reference_rate_observations` | Append-only SOFR observations with explicit percentage and decimal units. |
+| `daily_market_feature_definitions` | Immutable SPY close, return, RSI14, and signal-RV21D formula contracts. |
+| `daily_market_features` | Append-only compact SPY daily values and recursive RSI state. |
 | `market_snapshots` | Compact market context and freshness status for a run. |
 | `implied_variance_term_structure` | VIX-style implied variance results by target tenor. |
 | `forecast_variance_term_structure` | Locked Corsi forecast variance results by target tenor. |
@@ -60,6 +64,11 @@ All objects live in the `vrp` schema.
 | `qa_results` | Machine-readable hard gates, warnings, evidence, and expected values. |
 | `signal_publications` | Append-only visibility boundary for fully accepted snapshots. |
 | `latest_published_snapshot` | One-query latest decision in each publication scope. |
+
+The reference-data tables retain only new or corrected rows for each accepted
+release. Corrections point to their predecessors; current views select the
+unsuperseded row. See [`REFERENCE_DATA_STORAGE.md`](REFERENCE_DATA_STORAGE.md)
+for the exact source units, formulas, warm-up behavior, and migration contract.
 
 Nine rows are expected in each term-structure and feature set for the current 9, 12, 15, 18, 21, 24, 27, 30, and 33-day contract. A missing tenor should still receive a row with `MISSING` or `FAILED` status so absence is explicit and can fail the applicable QA gate.
 
