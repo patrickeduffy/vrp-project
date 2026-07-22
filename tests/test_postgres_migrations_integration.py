@@ -300,6 +300,11 @@ def synthetic_eod_snapshot(root: Path) -> EodSnapshot:
 
 @unittest.skipUnless(TEST_DSN, "VRP test PostgreSQL is not configured")
 class PostgresMigrationIntegrationTests(unittest.TestCase):
+    migrations = (
+        ROOT / "migrations/0001_operational_schema.sql",
+        ROOT / "migrations/0002_reference_data.sql",
+    )
+
     @classmethod
     def setUpClass(cls):
         cls.connection = psycopg.connect(TEST_DSN, autocommit=True)
@@ -310,20 +315,35 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     raise RuntimeError(
                         "VRP_TEST_DATABASE_URL must point to a fresh disposable test database"
                     )
-                for migration in (
-                    ROOT / "migrations/0001_operational_schema.sql",
-                    ROOT / "migrations/0002_reference_data.sql",
-                ):
-                    cursor.execute(migration.read_text(encoding="utf-8"), prepare=False)
-            cls.repository_connection = psycopg.connect(TEST_DSN)
         except Exception:
             cls.connection.close()
             raise
 
+    def setUp(self):
+        # Every integration test receives its own freshly migrated VRP schema.
+        # The class-level guard above ensures this can only target a database
+        # that was empty when the suite started.
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("DROP SCHEMA IF EXISTS vrp CASCADE")
+                for migration in self.migrations:
+                    cursor.execute(
+                        migration.read_text(encoding="utf-8"),
+                        prepare=False,
+                    )
+        except Exception:
+            self.connection.rollback()
+            raise
+        self.repository_connection = psycopg.connect(TEST_DSN)
+
+    def tearDown(self):
+        try:
+            self.repository_connection.rollback()
+        finally:
+            self.repository_connection.close()
+
     @classmethod
     def tearDownClass(cls):
-        cls.repository_connection.rollback()
-        cls.repository_connection.close()
         cls.connection.close()
 
     def _insert_asset(self, dataset_name: str, digest_character: str):
