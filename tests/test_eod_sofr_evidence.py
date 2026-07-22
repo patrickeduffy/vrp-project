@@ -43,6 +43,9 @@ class SofrUpdaterEvidenceTests(unittest.TestCase):
         self.payload = {
             "status": "PUBLISHED",
             "published": True,
+            "changes_detected": True,
+            "rows_added": 1,
+            "rows_revised": 0,
             "hard_checks_passed": True,
             "source": "FRED_SOFR",
             "run_timestamp_utc": TIMESTAMP,
@@ -108,6 +111,7 @@ class SofrUpdaterEvidenceTests(unittest.TestCase):
         invalid_values = {
             "status": "FAILED",
             "published": False,
+            "changes_detected": False,
             "hard_checks_passed": False,
             "source": "OTHER",
         }
@@ -119,6 +123,80 @@ class SofrUpdaterEvidenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(SofrEvidenceError, field):
                     self._load()
                 self.payload[field] = original
+
+    def test_accepts_no_change_with_exact_unchanged_markers(self):
+        self.payload.update(
+            {
+                "status": "NO_CHANGE",
+                "published": False,
+                "changes_detected": False,
+                "rows_added": 0,
+                "rows_revised": 0,
+            }
+        )
+        self._write_manifest()
+
+        expected_history = self._test_normalizer(self.snapshot_path)
+        evidence = self._load()
+
+        self.assertEqual(evidence.row_count, 2)
+        self.assertEqual(evidence.end_date, date(2018, 4, 4))
+        self.assertEqual(
+            evidence.normalized_content_sha256,
+            expected_history.content_sha256,
+        )
+        self.assertEqual(evidence.refreshed_snapshot_sha256, _sha256(self.snapshot_path))
+
+    def test_no_change_rejects_any_change_or_publication_marker(self):
+        no_change = {
+            "status": "NO_CHANGE",
+            "published": False,
+            "changes_detected": False,
+            "rows_added": 0,
+            "rows_revised": 0,
+            "hard_checks_passed": True,
+            "source": "FRED_SOFR",
+        }
+        invalid_values = {
+            "published": True,
+            "changes_detected": True,
+            "rows_added": 1,
+            "rows_revised": 1,
+            "hard_checks_passed": False,
+            "source": "OTHER",
+        }
+        for field, invalid in invalid_values.items():
+            with self.subTest(field=field):
+                self.payload.update(no_change)
+                self.payload[field] = invalid
+                self._write_manifest()
+                with self.assertRaisesRegex(SofrEvidenceError, field):
+                    self._load()
+
+    def test_rejects_check_only_and_failed_statuses(self):
+        for status in ("CHECK_ONLY", "FAILED", "FAILED_VALIDATION"):
+            with self.subTest(status=status):
+                self.payload["status"] = status
+                self._write_manifest()
+                with self.assertRaisesRegex(SofrEvidenceError, "status"):
+                    self._load()
+
+    def test_published_requires_added_or_revised_rows(self):
+        for rows_added, rows_revised in ((0, 0), (-1, 0), (0, -1), (True, 0)):
+            with self.subTest(
+                rows_added=rows_added,
+                rows_revised=rows_revised,
+            ):
+                self.payload["rows_added"] = rows_added
+                self.payload["rows_revised"] = rows_revised
+                self._write_manifest()
+                with self.assertRaisesRegex(SofrEvidenceError, "row"):
+                    self._load()
+
+        self.payload["rows_added"] = 0
+        self.payload["rows_revised"] = 1
+        self._write_manifest()
+        self._load()
 
     def test_manifest_date_range_and_row_count_must_match_normalized_snapshot(self):
         invalid_values = {

@@ -19,6 +19,12 @@ against it.
   every database load. Do not put a password in the command line or commit it to
   a file.
 
+The SOFR updater evidence may have status `PUBLISHED` or `NO_CHANGE`. A
+`NO_CHANGE` snapshot is accepted only when its hard checks passed, it was not
+published, `changes_detected` is false, and both added and revised row counts
+are zero. `CHECK_ONLY`, failed, or internally inconsistent updater evidence is
+rejected.
+
 The recorder reads only the staged files named by the completed run. It hashes
 them again and validates their row-level projection before any database work.
 It never repairs or rewrites a staged or canonical file.
