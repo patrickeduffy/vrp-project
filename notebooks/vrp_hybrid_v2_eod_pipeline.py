@@ -681,7 +681,7 @@ def pipeline(config: PipelineConfig) -> dict[str, Any]:
         write_json(audit_dir / "run_manifest.json", manifest)
         progress("complete", 100, "Hybrid v2 EOD pipeline completed")
         return manifest
-    except Exception as exc:
+    except BaseException as exc:
         if config.publish or backup_map:
             restore_files(backup_map)
         error_path = audit_dir / "pipeline_error.txt"
@@ -745,6 +745,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("=" * 110)
     print("PASS — Hybrid v2 EOD pipeline completed.")
     print(f"Manifest: {run_dir / 'run_manifest.json'}")
+    print(f"VRP_EOD_MANIFEST_PATH={run_dir / 'run_manifest.json'}")
     print("=" * 110)
     return 0
 

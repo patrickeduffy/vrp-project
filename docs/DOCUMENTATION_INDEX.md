@@ -10,6 +10,7 @@
 6. [`DATABASE_ARCHITECTURE.md`](DATABASE_ARCHITECTURE.md) — PostgreSQL operational schema and Parquet boundaries.
 
 7. [`REFERENCE_DATA_STORAGE.md`](REFERENCE_DATA_STORAGE.md) — compact SOFR/SPY history, units, formulas, and revision rules.
+8. [`EOD_POSTGRES_SHADOW.md`](EOD_POSTGRES_SHADOW.md) — exact-run shadow recording, least-privilege roles, and opt-in operation.
 
 ## Immutable model-lock records
 

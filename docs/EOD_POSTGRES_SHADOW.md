@@ -19,6 +19,15 @@ against it.
   every database load. Do not put a password in the command line or commit it to
   a file.
 
+Manual loader commands continue to use `VRP_DATABASE_URL`. The integrated EOD
+wrapper instead requires two separately scoped values:
+
+- `VRP_REFERENCE_DATABASE_URL` for immutable SOFR/SPY reference maintenance;
+- `VRP_EOD_DATABASE_URL` for the post-publication EOD snapshot.
+
+The wrapper exposes only one connection to each child loader and does not
+expose either one to the file pipeline.
+
 The SOFR updater evidence may have status `PUBLISHED` or `NO_CHANGE`. A
 `NO_CHANGE` snapshot is accepted only when its hard checks passed, it was not
 published, `changes_detected` is false, and both added and revised row counts
@@ -104,6 +113,95 @@ checks the stored version and asset lineage, and reconciles the complete
 database projection again. A changed code version or changed content produces a
 different logical shadow run.
 
+## Least-privilege runtime roles
+
+Apply `ops/postgres/provision_shadow_runtime_roles.sql` as the database
+migration owner while connected to the migrated database:
+
+```powershell
+psql -d vrp_shadow -f ops\postgres\provision_shadow_runtime_roles.sql
+```
+
+It creates two password-free capability roles:
+
+- `vrp_reference_loader` can append validated reference releases/rows and
+  maintain their run/QA ledger;
+- `vrp_eod_shadow_writer` can insert the EOD run projection and update only its
+  run/stage status columns.
+
+The EOD role may read `vrp.signal_publications` to prove that it remains empty,
+but it has no write privilege there. It also cannot mutate reference history.
+Neither capability role can log in, create schema objects, create
+databases/roles, or use superuser privileges.
+
+The provisioning script revokes default `PUBLIC` execution of custom
+functions in schema `vrp`, then grants the reference loader only the functions
+its immutable-history workflow needs.
+
+Create separate local LOGIN roles as the administrator, grant each exactly one
+capability role, and assign passwords interactively:
+
+```text
+CREATE ROLE vrp_reference_loader_local LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+GRANT vrp_reference_loader TO vrp_reference_loader_local;
+\password vrp_reference_loader_local
+
+CREATE ROLE vrp_eod_shadow_local LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+GRANT vrp_eod_shadow_writer TO vrp_eod_shadow_local;
+\password vrp_eod_shadow_local
+```
+
+Do not put those passwords in SQL source. For unattended local runs, use an
+owner-restricted `pgpass.conf` outside the repository and connection strings
+that contain the usernames but no passwords.
+
+## Integrated post-publication mode
+
+The stable runner and Streamlit dashboard can opt in:
+
+```powershell
+$env:VRP_REFERENCE_DATABASE_URL = "host=127.0.0.1 port=5432 dbname=vrp_shadow user=vrp_reference_loader_local"
+$env:VRP_EOD_DATABASE_URL = "host=127.0.0.1 port=5432 dbname=vrp_shadow user=vrp_eod_shadow_local"
+
+python scripts\run_eod.py `
+  --project-root C:\Users\patri\vrp_project `
+  --shadow-write
+```
+
+The integrated sequence is strictly:
+
+```text
+file pipeline publishes and final health passes
+    -> exact emitted run manifest is validated
+    -> SOFR/SPY reference history is loaded
+    -> that exact EOD snapshot is recorded
+```
+
+The wrapper never discovers the run by modification time or “latest folder.”
+The EOD child emits a dedicated `VRP_EOD_MANIFEST_PATH` marker. The wrapper
+pins the clean checkout’s full Git commit and requester once before execution,
+revalidates that clean HEAD and the tracked runtime/loader paths immediately
+before each credentialed loader, passes the same identity to both loaders, and
+writes a sanitized
+`post_publish_shadow_status.json` beside the EOD manifest.
+
+Before canonical execution, it also proves through read-only database queries
+that the two connection strings use distinct, non-superuser accounts with the
+one expected capability membership, no VRP/database ownership, and exactly the
+reviewed table, column, sequence, and function privilege allowlist. Each
+loader has bounded connection, lock, statement, and process timeouts.
+
+Shadow writing is disabled by default and is incompatible with `--no-publish`.
+If either database load fails after publication, exit code `3` means:
+
+```text
+canonical file publication succeeded and remains authoritative;
+the PostgreSQL shadow is incomplete and needs reconciliation.
+```
+
+That condition never triggers the file pipeline’s rollback and is not reported
+as `FAILED — NOT PUBLISHED`.
+
 ## Deliberate boundaries
 
 - No row is inserted into `vrp.signal_publications`.
@@ -134,6 +232,6 @@ PostgreSQL 17 using the successful EOD audit run
 
 This acceptance proves the recorder and schema for one completed run. It does
 not authorize a database-backed signal publication or make PostgreSQL the
-calculation source of record. Automated daily shadow writing requires a
-separate least-privilege runtime role, orchestration integration, and repeated
-file-versus-database reconciliation.
+calculation source of record. The least-privilege, opt-in orchestration path is
+implemented; production enablement still requires provisioning the two local
+LOGIN roles and accepting repeated daily file-versus-database reconciliation.
