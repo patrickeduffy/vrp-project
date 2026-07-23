@@ -15,6 +15,7 @@ ThetaData + SOFR
     -> Hybrid v2 signal publisher
     -> canonical outputs
     -> production health check
+    -> optional PostgreSQL reference sync + EOD shadow record
     -> Streamlit display
 ```
 
@@ -34,6 +35,7 @@ The accepted repair baseline is through 2026-07-16. Normal production runs advan
 - `scripts/run_eod.py` — stable production-facing EOD entry point
 - `scripts/golden_eod.py` — golden-output capture and reconciliation
 - `scripts/load_reference_history.py` — validated, revision-safe SOFR/SPY historical backfill
+- `scripts/load_eod_snapshot.py` — exact completed-run PostgreSQL shadow recorder
 - `notebooks/vrp_hybrid_v2_eod_pipeline.py` — EOD orchestrator
 - `notebooks/vrp_hybrid_v2_signal_publish.py` — locked signal, sizing, and selection logic
 - `notebooks/vrp_hybrid_v2_health_check.py` — production data and contract validation
@@ -60,6 +62,24 @@ Useful diagnostic options:
 - `--force-recalculate`
 - `--skip-upstream`
 - `--no-publish`
+- `--shadow-write` — after a successful publication, update reference history
+  and record the exact EOD run in the non-authoritative PostgreSQL shadow
+
+Shadow writing is disabled by default and cannot be combined with
+`--no-publish`. It requires separate `VRP_REFERENCE_DATABASE_URL` and
+`VRP_EOD_DATABASE_URL` environment values for the least-privilege loader
+accounts. The wrapper verifies that the users are distinct, non-superuser
+members of only their intended capability roles, own no VRP objects, and have
+exactly the reviewed table/column/function privileges before canonical work
+begins.
+Database credentials are never accepted as command arguments. Shadow loaders
+also have bounded connection, statement, lock, and process timeouts.
+The clean Git HEAD and tracked loader/config sources are revalidated immediately
+before each credentialed loader starts.
+
+If canonical publication succeeds but shadow recording fails, the command
+returns exit code `3` and explicitly retains the healthy file publication. It
+does not invoke canonical rollback or claim that the signal was not published.
 
 ## Run the health check
 
@@ -104,12 +124,19 @@ On the production computer, run `START VRP HYBRID V2.bat`. The equivalent direct
 python -m streamlit run notebooks\streamlit_vrp_hybrid_v2_eod.py
 ```
 
+The dashboard routes refreshes through `scripts/run_eod.py`. Its advanced
+controls include the same opt-in PostgreSQL shadow recording. Set
+`VRP_EOD_SHADOW_WRITE=1` in the local launch environment only when the
+least-privilege database accounts have been configured and the checkbox should
+default to enabled.
+
 ## Repository layout
 
 - `config/` — active model and runtime configuration
 - `src/vrp/` — stable production package interfaces
 - `scripts/` — production and administrative command-line entry points
 - `migrations/` — versioned PostgreSQL operational schema
+- `ops/` — reviewed operator-run provisioning assets; no credentials
 - `notebooks/` — active production Python entry points and current research
 - `tests/` — regression and golden tests for production contracts
 - `docs/` — active documentation and immutable model-lock records
@@ -130,7 +157,12 @@ The repository intentionally excludes:
 
 These remain on the production computer and are covered by `.gitignore`.
 
-The planned storage boundary is Parquet for immutable raw and standardized market data, PostgreSQL for operational state and published signal outputs, and DuckDB for research queries over Parquet. See [`docs/DATABASE_ARCHITECTURE.md`](docs/DATABASE_ARCHITECTURE.md).
+The storage boundary is Parquet for authoritative raw, standardized, and
+current file-pipeline outputs; PostgreSQL currently holds a non-authoritative
+operational shadow; and DuckDB supports research queries over Parquet. A later,
+separately approved cutover is required before PostgreSQL can become the
+publication authority. See
+[`docs/DATABASE_ARCHITECTURE.md`](docs/DATABASE_ARCHITECTURE.md).
 
 ## Documentation
 

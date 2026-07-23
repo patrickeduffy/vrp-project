@@ -257,9 +257,17 @@ Apply migrations in numeric order inside transactions using a dedicated database
 Recommended role boundaries are:
 
 - a migration owner that can create and alter schema objects;
-- a pipeline writer that can insert/update operational rows but cannot alter schema;
+- a reference-history loader that can append validated SOFR/SPY revisions;
+- an EOD shadow writer that can insert operational snapshots but cannot mutate
+  reference history or write `signal_publications`;
+- a later publication writer, introduced only at an approved cutover;
 - a dashboard reader with `SELECT` on the latest view and required history tables; and
 - a backup operator managed by the hosting platform.
+
+The reviewed capability-role grants are in
+`ops/postgres/provision_shadow_runtime_roles.sql`. The current opt-in EOD
+integration stops before `signal_publications`: PostgreSQL remains a
+reconciliation shadow while the file pipeline is authoritative.
 
 Back up PostgreSQL and object storage independently. A recovery test must verify both the operational database and every Parquet object referenced by a published run. PostgreSQL alone is not a complete production backup.
 
@@ -275,4 +283,8 @@ The first migration intentionally does not include:
 - automated order placement; or
 - a bulk migration of all historical research artifacts.
 
-Begin by dual-writing new EOD operational outputs, reconciling golden dates, and publishing only after the database path reproduces the locked file-based result. Backfill compact derived history only when it serves a concrete operational or dashboard query.
+The current stage dual-writes new EOD operational outputs without creating a
+database publication record. Reconcile repeated daily results first. A later
+cutover may publish only after the database path reproduces the locked
+file-based result and receives separate approval. Backfill compact derived
+history only when it serves a concrete operational or dashboard query.

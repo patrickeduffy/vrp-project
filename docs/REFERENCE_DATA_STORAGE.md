@@ -131,6 +131,12 @@ Safety properties:
 - a failed publication rolls back every data row and records a failed run;
 - credentials come only from `VRP_DATABASE_URL`, never a command argument.
 
+For the integrated post-publication EOD path, the same loader runs first under
+the narrower `vrp_reference_loader` capability through
+`VRP_REFERENCE_DATABASE_URL`. The subsequent EOD snapshot uses a different
+`VRP_EOD_DATABASE_URL` identity. The wrapper exposes only one database target
+to each child process.
+
 The pinned July 21 source acceptance record lives at
 `tests/fixtures/reference_history_20260721_baseline.json`. It preserves source
 digests, row counts, date coverage, and latest accepted values for review.
@@ -159,7 +165,8 @@ this stage. GitHub Actions starts a disposable PostgreSQL 17 service, applies
 migrations `0001` and `0002`, exercises initial load, identical rerun,
 correction, rollback, and retry behavior, and confirms the append-only trigger.
 
-A durable PostgreSQL target will be introduced for the EOD dual-write stage.
-Application connections use `VRP_DATABASE_URL`; production or durable
-credentials must never be committed or placed on command lines. The password in
-CI belongs only to its disposable test container.
+A durable local PostgreSQL target has passed initial reference-history and EOD
+shadow acceptance. Manual loader commands use `VRP_DATABASE_URL`; the opt-in
+integrated path uses the two narrower environment values described above.
+Production or durable credentials must never be committed or placed on command
+lines. The password in CI belongs only to its disposable test container.

@@ -32,12 +32,17 @@ Completed foundation increments:
 - deterministic rerun proof for both historical reference loads and the EOD
   snapshot (`no_op: true` with stable identities), with zero rows in
   `vrp.signal_publications`.
+- an opt-in post-publication path in the stable EOD runner and Streamlit that
+  loads reference history first, records the exact emitted EOD manifest second,
+  and keeps database credentials out of commands and audit status;
+- separate least-privilege PostgreSQL capability roles for reference history
+  and EOD snapshots, with no database publication authority.
 
 The local durable database and one-run shadow reconciliation gate have passed.
-The next gate is to add an optional post-publication shadow-write step to the
-stable EOD entry point, using a least-privilege writer role and an explicit
-failure policy. PostgreSQL remains non-authoritative until repeated daily
-comparisons are accepted.
+The opt-in orchestration and role contracts are implemented. The next gate is
+to provision separate local LOGIN accounts, exercise one controlled integrated
+run, and accept repeated daily file-versus-database comparisons. PostgreSQL
+remains non-authoritative throughout that observation period.
 
 1. Preserve accepted production outputs as golden cases.
 2. Introduce stable `src/vrp/` package boundaries around the validated calculations.

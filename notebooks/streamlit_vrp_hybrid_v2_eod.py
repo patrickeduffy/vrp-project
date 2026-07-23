@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,7 +10,13 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+
+from vrp.orchestration.eod import terminate_process_tree
 from vrp_hybrid_v2_common import DEFAULT_PROJECT_ROOT, load_json, load_runtime_config, resolve_path
+
+SHADOW_FAILURE_EXIT_CODE = 3
 
 
 st.set_page_config(
@@ -60,8 +67,9 @@ def run_pipeline(
     target_date: str | None,
     force_recalculate: bool,
     skip_upstream: bool,
+    shadow_write: bool,
 ) -> tuple[int, str]:
-    script = Path(__file__).with_name("vrp_hybrid_v2_eod_pipeline.py")
+    script = project_root / "scripts/run_eod.py"
     command = [
         sys.executable,
         "-u",
@@ -79,6 +87,8 @@ def run_pipeline(
         command.append("--force-recalculate")
     if skip_upstream:
         command.append("--skip-upstream")
+    if shadow_write:
+        command.append("--shadow-write")
 
     progress_bar = st.progress(0, text="Starting production refresh…")
     status_line = st.empty()
@@ -91,29 +101,72 @@ def run_pipeline(
         text=True,
         bufsize=1,
         universal_newlines=True,
+        cwd=project_root,
+        creationflags=(
+            subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        ),
+        start_new_session=os.name != "nt",
     )
     assert process.stdout is not None
-    for raw in process.stdout:
-        line = raw.rstrip("\n")
-        lines.append(line)
-        if line.startswith("VRP_PROGRESS|"):
-            parts = line.split("|", 3)
-            if len(parts) == 4:
-                _, step, pct, message = parts
-                try:
-                    progress_bar.progress(max(0, min(100, int(pct))), text=f"{step}: {message}")
-                except ValueError:
-                    pass
-                status_line.info(f"{step}: {message}")
-        console.code("\n".join(lines[-220:]), language="text")
-    return_code = process.wait()
+    try:
+        for raw in process.stdout:
+            line = raw.rstrip("\n")
+            lines.append(line)
+            if line.startswith("VRP_PROGRESS|"):
+                parts = line.split("|", 3)
+                if len(parts) == 4:
+                    _, step, pct, message = parts
+                    try:
+                        progress_bar.progress(
+                            max(0, min(100, int(pct))),
+                            text=f"{step}: {message}",
+                        )
+                    except ValueError:
+                        pass
+                    status_line.info(f"{step}: {message}")
+            elif line.startswith("VRP_SHADOW|"):
+                parts = line.split("|", 2)
+                if len(parts) == 3:
+                    _, shadow_step, message = parts
+                    progress_bar.progress(
+                        99,
+                        text=f"PostgreSQL shadow — {shadow_step.lower()}: {message}",
+                    )
+                    status_line.info(f"PostgreSQL shadow: {message}")
+            console.code("\n".join(lines[-220:]), language="text")
+        return_code = process.wait()
+    except BaseException:
+        terminate_process_tree(process)
+        raise
+    finally:
+        process.stdout.close()
     output = "\n".join(lines)
     if return_code == 0:
         progress_bar.progress(100, text="Refresh completed and published.")
-        status_line.success("PASS — latest completed EOD signal is published.")
+        if shadow_write:
+            status_line.success(
+                "PASS — latest EOD signal is published and its PostgreSQL "
+                "shadow is recorded."
+            )
+        else:
+            status_line.success("PASS — latest completed EOD signal is published.")
+    elif return_code == SHADOW_FAILURE_EXIT_CODE:
+        progress_bar.progress(
+            100,
+            text="File refresh published; PostgreSQL shadow recording failed.",
+        )
+        status_line.warning(
+            "PUBLISHED — canonical files are healthy, but the non-authoritative "
+            "PostgreSQL shadow needs attention."
+        )
     else:
-        progress_bar.progress(100, text="Refresh failed — canonical outputs were not retained.")
-        status_line.error("FAILED — NOT PUBLISHED. Review the run console and audit directory.")
+        progress_bar.progress(
+            100,
+            text="Refresh did not complete; prior canonical outputs remain in place.",
+        )
+        status_line.error(
+            "REFRESH FAILED — review the run console and audit directory."
+        )
     return return_code, output
 
 
@@ -133,6 +186,10 @@ def format_num(value: Any, digits: int = 3) -> str:
         return f"{float(value):.{digits}f}"
     except Exception:
         return "—"
+
+
+def environment_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def display_latest_signal(decisions: pd.DataFrame, snapshot: pd.DataFrame, approved_nav: float) -> None:
@@ -321,6 +378,14 @@ with st.sidebar:
         manual_date = st.date_input("Target date") if manual_date_enabled else None
         force_recalculate = st.checkbox("Force recalculate from earliest detected gap", value=False)
         skip_upstream = st.checkbox("Skip upstream backfill (diagnostic only)", value=False)
+        shadow_write = st.checkbox(
+            "Record non-authoritative PostgreSQL shadow",
+            value=environment_flag("VRP_EOD_SHADOW_WRITE"),
+            help=(
+                "Runs only after successful canonical publication. PostgreSQL "
+                "remains a reconciliation copy, not the signal source of record."
+            ),
+        )
     st.caption(f"Runtime config: {runtime_path}")
 
 run_clicked = st.button(
@@ -341,6 +406,7 @@ if run_clicked:
             target_date=target_text,
             force_recalculate=force_recalculate,
             skip_upstream=skip_upstream,
+            shadow_write=shadow_write,
         )
         st.session_state["latest_run_console"] = output
         st.session_state["latest_run_code"] = code
