@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+WINDOWS_CTRL_BREAK_EVENT = 1
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -259,11 +260,16 @@ class ManifestSelectionTests(unittest.TestCase):
             send_signal=MagicMock(),
             wait=MagicMock(return_value=0),
         )
-        with patch("vrp.orchestration.eod.os.name", "nt"), patch(
+        with patch("vrp.orchestration.eod.os.name", "nt"), patch.object(
+            signal,
+            "CTRL_BREAK_EVENT",
+            WINDOWS_CTRL_BREAK_EVENT,
+            create=True,
+        ), patch(
             "vrp.orchestration.eod.subprocess.run"
         ) as taskkill:
             terminate_process_tree(process, grace_seconds=1)
-        process.send_signal.assert_called_once_with(signal.CTRL_BREAK_EVENT)
+        process.send_signal.assert_called_once_with(WINDOWS_CTRL_BREAK_EVENT)
         process.wait.assert_called_once_with(timeout=1)
         taskkill.assert_not_called()
 
@@ -276,11 +282,16 @@ class ManifestSelectionTests(unittest.TestCase):
                 side_effect=[subprocess.TimeoutExpired("process", 1), 0]
             ),
         )
-        with patch("vrp.orchestration.eod.os.name", "nt"), patch(
+        with patch("vrp.orchestration.eod.os.name", "nt"), patch.object(
+            signal,
+            "CTRL_BREAK_EVENT",
+            WINDOWS_CTRL_BREAK_EVENT,
+            create=True,
+        ), patch(
             "vrp.orchestration.eod.subprocess.run"
         ) as taskkill:
             terminate_process_tree(process, grace_seconds=1)
-        process.send_signal.assert_called_once_with(signal.CTRL_BREAK_EVENT)
+        process.send_signal.assert_called_once_with(WINDOWS_CTRL_BREAK_EVENT)
         taskkill.assert_called_once()
 
     def test_only_exact_eod_audit_manifest_is_accepted(self):
