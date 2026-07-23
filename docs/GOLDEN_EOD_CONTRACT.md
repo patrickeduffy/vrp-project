@@ -8,11 +8,20 @@ The fixture does not recalculate the model. It records canonical signal and sele
 
 Baseline:
 
-- Clean checkout `HEAD` at capture: `c3857984def9d295bd49dc7eab7c5a8421b0ed5b`
-- Local baseline tag: `eod-v2-production-baseline-2026-07-21`
+- Clean checkout `HEAD` at accepted recapture:
+  `c8efe2ed22d53e57ab5e93890dd962e75e8a1448`
+- Original model-baseline tag: `eod-v2-production-baseline-2026-07-21`
 - Fixture: `tests/golden/eod_v2_production_baseline.json`
 - Absolute tolerance: `1e-12`
 - Relative tolerance: `1e-10`
+
+The fixture was recaptured after the successful July 22, 2026 EOD run accepted
+ThetaData's revised official July 21 SPY record (`open` 746.25 to 746.27,
+`low` 744.19 to 744.18, `close` 748.32 to 748.28, and `volume` 19,940,992
+to 34,173,496). Only the `latest_no_trade` case changed; the other five
+golden cases remained byte-for-byte equivalent at the case-payload level, and
+the July 21 decision remained `NO_TRADE`. This was an accepted historical
+source revision, not a model, threshold, sizing, or selector change.
 
 ## Covered cases
 
