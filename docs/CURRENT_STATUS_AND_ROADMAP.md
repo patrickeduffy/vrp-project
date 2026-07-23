@@ -4,11 +4,12 @@
 
 The locked Hybrid v2 put-sleeve methodology and repaired completed-EOD calculation path are the accepted production baseline.
 
-- Canonical history is current through 2026-07-21.
+- Canonical history is current through 2026-07-22.
 - The July 2026 source, SOFR, expiration-clock, and Wilder-RSI repairs are accepted.
 - The existing EOD regression suite passes.
-- Baseline commit: `c3857984def9d295bd49dc7eab7c5a8421b0ed5b`.
-- Baseline tag: `eod-v2-production-baseline-2026-07-21`.
+- Original model-baseline tag: `eod-v2-production-baseline-2026-07-21`.
+- Accepted golden recapture commit:
+  `c8efe2ed22d53e57ab5e93890dd962e75e8a1448`.
 - Golden EOD examples protect representative trade and no-trade decisions.
 
 The current objective is to complete the production pipeline, intraday signal capability, and deployment before resuming other research.
@@ -24,10 +25,19 @@ Completed foundation increments:
 - PostgreSQL migration `0002` for revision-safe SOFR and SPY daily history;
 - deterministic historical normalization and backfill interfaces for SOFR,
   SPY close/log return, Wilder RSI14 state, and signal RV21D.
+- local PostgreSQL 17 shadow acceptance for the completed 2026-07-22 EOD run:
+  migrations `0001` and `0002`, 2,073 SOFR observations, 2,149 SPY daily
+  feature rows, one market snapshot, nine implied rows, nine forecast rows,
+  nine feature rows, 18 rule evaluations, and one `NO_TRADE` decision;
+- deterministic rerun proof for both historical reference loads and the EOD
+  snapshot (`no_op: true` with stable identities), with zero rows in
+  `vrp.signal_publications`.
 
-The next gate after the historical-loader PR is accepted is a durable database
-target plus EOD dual-write reconciliation. PostgreSQL does not become the
-authoritative calculation source until that comparison passes.
+The local durable database and one-run shadow reconciliation gate have passed.
+The next gate is to add an optional post-publication shadow-write step to the
+stable EOD entry point, using a least-privilege writer role and an explicit
+failure policy. PostgreSQL remains non-authoritative until repeated daily
+comparisons are accepted.
 
 1. Preserve accepted production outputs as golden cases.
 2. Introduce stable `src/vrp/` package boundaries around the validated calculations.

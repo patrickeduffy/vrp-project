@@ -213,9 +213,30 @@ class SofrUpdaterEvidenceTests(unittest.TestCase):
                     self._load()
                 self.payload[field] = original
 
-    def test_snapshot_must_end_strictly_before_valuation_date(self):
+    def test_selects_latest_strictly_prior_row_when_snapshot_reaches_valuation_date(self):
+        self.snapshot_path.write_text(
+            "observation_date,SOFR\n"
+            "2018-04-03,1.83\n"
+            "2018-04-04,1.74\n"
+            "2018-04-05,1.75\n",
+            encoding="utf-8",
+        )
+        self.payload["new_max_date"] = "2018-04-05"
+        self.payload["new_rows_total"] = 3
+        self._write_manifest()
+
+        expected_history = self._test_normalizer(self.snapshot_path)
+        evidence = self._load(date(2018, 4, 5))
+
+        self.assertEqual(evidence.end_date, date(2018, 4, 5))
+        self.assertEqual(evidence.row_count, 3)
+        self.assertEqual(evidence.observation_date, date(2018, 4, 4))
+        self.assertEqual(evidence.rate_decimal, Decimal("0.017400000000"))
+        self.assertEqual(evidence.row_sha256, expected_history.rows[1].row_sha256)
+
+    def test_snapshot_requires_an_observation_strictly_before_valuation_date(self):
         with self.assertRaisesRegex(SofrEvidenceError, "strictly before"):
-            self._load(date(2018, 4, 4))
+            self._load(date(2018, 4, 3))
 
     def test_detects_snapshot_change_during_normalization(self):
         def mutate_after_read(path: Path):

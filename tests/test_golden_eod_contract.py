@@ -66,7 +66,7 @@ class GoldenFixtureStructureTests(unittest.TestCase):
     def test_fixture_is_anchored_to_the_accepted_baseline(self):
         self.assertEqual(
             self.fixture["baseline_commit"],
-            "c3857984def9d295bd49dc7eab7c5a8421b0ed5b",
+            "c8efe2ed22d53e57ab5e93890dd962e75e8a1448",
         )
 
     def test_fixture_covers_no_trade_and_every_selected_category(self):

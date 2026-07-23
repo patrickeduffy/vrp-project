@@ -25,6 +25,13 @@ published, `changes_detected` is false, and both added and revised row counts
 are zero. `CHECK_ONLY`, failed, or internally inconsistent updater evidence is
 rejected.
 
+The updater snapshot may already contain an observation dated on or after the
+EOD valuation date, especially when a completed run is recorded the following
+morning. The recorder hashes the complete updater snapshot, then pins the
+latest observation strictly before the valuation date. Later rows are evidence
+in the frozen source snapshot but are never selected as the rate for that EOD
+valuation.
+
 The recorder reads only the staged files named by the completed run. It hashes
 them again and validates their row-level projection before any database work.
 It never repairs or rewrites a staged or canonical file.
@@ -105,3 +112,28 @@ different logical shadow run.
   instruction.
 - The official EOD signal continues to come from the accepted file pipeline
   until a later, separately approved cutover.
+
+## Initial local acceptance
+
+The initial durable local acceptance completed on 2026-07-23 against
+PostgreSQL 17 using the successful EOD audit run
+`data/audit/vrp_hybrid_v2_eod/20260723_142305` for valuation date 2026-07-22.
+
+- migrations `0001` and `0002` were registered successfully;
+- the reference loader inserted 2,073 SOFR observations and 2,149 SPY daily
+  feature rows with zero corrections;
+- the EOD recorder inserted one market snapshot, nine implied-variance rows,
+  nine forecast rows, nine signal-feature rows, 18 rule evaluations, and one
+  `NO_TRADE` decision;
+- the selected SOFR observation was 2026-07-21 at 3.61%, strictly before the
+  valuation date;
+- identical reference and EOD reruns returned `no_op: true` with the same
+  release and run identities;
+- direct database counts reconciled exactly; and
+- `vrp.signal_publications` remained empty.
+
+This acceptance proves the recorder and schema for one completed run. It does
+not authorize a database-backed signal publication or make PostgreSQL the
+calculation source of record. Automated daily shadow writing requires a
+separate least-privilege runtime role, orchestration integration, and repeated
+file-versus-database reconciliation.
