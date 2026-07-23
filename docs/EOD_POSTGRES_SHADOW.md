@@ -25,6 +25,13 @@ published, `changes_detected` is false, and both added and revised row counts
 are zero. `CHECK_ONLY`, failed, or internally inconsistent updater evidence is
 rejected.
 
+The updater snapshot may already contain an observation dated on or after the
+EOD valuation date, especially when a completed run is recorded the following
+morning. The recorder hashes the complete updater snapshot, then pins the
+latest observation strictly before the valuation date. Later rows are evidence
+in the frozen source snapshot but are never selected as the rate for that EOD
+valuation.
+
 The recorder reads only the staged files named by the completed run. It hashes
 them again and validates their row-level projection before any database work.
 It never repairs or rewrites a staged or canonical file.

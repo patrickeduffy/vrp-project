@@ -249,12 +249,16 @@ def load_sofr_updater_evidence(
         _fail("SOFR manifest new_max_date does not match the normalized snapshot")
     if row_count != len(normalized.rows):
         _fail("SOFR manifest new_rows_total does not match the normalized snapshot")
-    if end_date >= valuation_date:
-        _fail("SOFR snapshot end_date must be strictly before the EOD valuation_date")
-
-    selected = normalized.rows[-1]
-    if selected.observation_date != end_date:
+    if normalized.rows[-1].observation_date != end_date:
         _fail("SOFR normalized history is not ordered through its declared end_date")
+    try:
+        selected = next(
+            row
+            for row in reversed(normalized.rows)
+            if row.observation_date < valuation_date
+        )
+    except StopIteration:
+        _fail("SOFR snapshot has no observation strictly before the EOD valuation_date")
 
     # Reverify both evidence files after all parsing and normalization work.
     if _sha256_file(manifest_path, "SOFR updater manifest") != manifest_sha256:
