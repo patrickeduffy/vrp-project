@@ -18,6 +18,10 @@ It receives validated copies with file digests, formula versions, units, and
 pipeline lineage so the two paths can be reconciled before database publication
 becomes authoritative.
 
+A normal published run through `scripts/run_eod.py` now performs this compact
+reference synchronization automatically as the first credentialed part of its
+PostgreSQL post-pass. That post-pass does not publish a trading signal.
+
 ## Source contracts
 
 ### SOFR
@@ -108,7 +112,8 @@ python scripts\load_reference_history.py all `
   --validate-only
 ```
 
-After a PostgreSQL target has migrations `0001` and `0002` and
+The following mutating command is an administrative standalone load, not the
+normal EOD path. After a PostgreSQL target has migrations `0001` and `0002` and
 `VRP_DATABASE_URL` is configured, load both histories with:
 
 ```powershell
@@ -116,6 +121,21 @@ python scripts\load_reference_history.py all `
   --project-root C:\Users\patri\vrp_project `
   --environment local
 ```
+
+Before a standalone mutation, the loader takes the project-wide EOD operation
+lock, requires that no obligated published EOD finalization is unresolved, and
+takes the database-global reference/shadow advisory lock. During automatic EOD
+finalization, the parent process holds that global lock plus a random
+token-specific advisory lock across both child loaders; the reference child
+must prove that both locks are held before it can write and holds a fixed
+child-active lock through its mutation. A copied environment token without the
+parent database locks is rejected, and an orphan child remains visible after a
+parent failure. Write-capable loads are also bound to the canonical production
+runtime contract and audit root rather than a caller-redirected queue.
+
+Consequently, the standalone loader cannot be used to leapfrog an older failed
+EOD post-pass. It also does not create either EOD finalization sidecar and cannot
+resolve that debt; use `scripts/finalize_eod_postgres.py` for an obligated run.
 
 Safety properties:
 
@@ -129,7 +149,10 @@ Safety properties:
 - a repeated invocation is a no-op, while a correction adds a successor row;
 - an older completed release remains reproducible after a newer correction;
 - a failed publication rolls back every data row and records a failed run;
-- credentials come only from `VRP_DATABASE_URL`, never a command argument.
+- credentials come only from `VRP_DATABASE_URL`, never a command argument;
+- direct and automatic mutations share the same project and database writer
+  coordination; and
+- no reference-data invocation inserts into `vrp.signal_publications`.
 
 The pinned July 21 source acceptance record lives at
 `tests/fixtures/reference_history_20260721_baseline.json`. It preserves source
@@ -157,9 +180,20 @@ already published run used.
 No local PostgreSQL installation is required to validate the files or review
 this stage. GitHub Actions starts a disposable PostgreSQL 17 service, applies
 migrations `0001` and `0002`, exercises initial load, identical rerun,
-correction, rollback, and retry behavior, and confirms the append-only trigger.
+correction, rollback, retry, and coordination behavior, and confirms the
+append-only trigger.
 
-A durable PostgreSQL target will be introduced for the EOD dual-write stage.
-Application connections use `VRP_DATABASE_URL`; production or durable
-credentials must never be committed or placed on command lines. The password in
-CI belongs only to its disposable test container.
+The EOD dual-write stage now supports a durable PostgreSQL target. Application
+connections use `VRP_DATABASE_URL`; production or durable credentials must
+never be committed or placed on command lines. The password in CI belongs only
+to its disposable test container.
+
+After restoring, replacing, or switching the PostgreSQL target, stop EOD and
+all standalone loaders. Sidecars are historical evidence, not proof of the
+active database's contents by themselves. Each new finalizer checks exact prior
+shadow identities against its connected target, but recovery remains an
+explicit stop-and-replay operation. Apply migrations, then replay and
+reconcile every
+published audit marked `postgres_postpass_required: true` oldest-first through
+`scripts/finalize_eod_postgres.py` before trusting the sidecars or resuming EOD.
+Do not advance compact reference history manually during that recovery.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import asdict
@@ -23,6 +24,21 @@ from vrp.reference_history.sources import (  # noqa: E402
     normalize_spy_daily_files,
 )
 from vrp.storage.postgres import connect_from_environment  # noqa: E402
+from vrp.orchestration.eod_finalization_gate import (  # noqa: E402
+    assert_no_unresolved_eod_finalizations,
+    completed_eod_finalization_evidence,
+    require_canonical_eod_runtime_config,
+    resolve_eod_audit_root,
+)
+from vrp.orchestration.eod_lock import exclusive_eod_writer_lock  # noqa: E402
+from vrp.storage.finalization_coordination import (  # noqa: E402
+    delegated_finalization_child_lease,
+    has_delegated_finalization_lease,
+    standalone_finalization_lease,
+)
+from vrp.storage.finalization_continuity import (  # noqa: E402
+    verify_database_finalization_continuity,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -38,6 +54,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--project-root", type=Path, default=REPOSITORY_ROOT)
     parser.add_argument("--runtime-config", type=Path, default=None)
+    parser.add_argument(
+        "--sofr-source",
+        type=Path,
+        default=None,
+        help="Optional exact SOFR CSV snapshot instead of the mutable canonical cache.",
+    )
+    parser.add_argument(
+        "--expected-sofr-source-sha256",
+        default=None,
+        help="Required raw-file SHA-256 assertion when --sofr-source is supplied.",
+    )
     parser.add_argument("--artifact-root", type=Path, default=None)
     parser.add_argument("--environment", default="local")
     parser.add_argument("--code-version", default=None)
@@ -58,6 +85,7 @@ def _absolute(path: Path, project_root: Path) -> Path:
 def _runtime_sources(
     project_root: Path,
     runtime_config: Path | None,
+    sofr_source: Path | None = None,
 ) -> dict[str, Path]:
     config_path = _absolute(
         runtime_config or Path("config/vrp_hybrid_v2_eod_runtime_config.json"),
@@ -71,9 +99,12 @@ def _runtime_sources(
     missing = [name for name in required if not canonical.get(name)]
     if missing:
         raise ValueError(f"runtime config is missing canonical paths: {missing}")
-    return {
+    paths = {
         name: _absolute(Path(str(canonical[name])), project_root) for name in required
     }
+    if sofr_source is not None:
+        paths["sofr_cache"] = _absolute(sofr_source.expanduser(), project_root)
+    return paths
 
 
 def _dataset_sources(name: str, paths: Mapping[str, Path]) -> dict[str, Path]:
@@ -147,8 +178,30 @@ def run(args: argparse.Namespace) -> list[dict[str, object]]:
     if args.generation < 0:
         raise ValueError("generation must be a non-negative integer")
     project_root = args.project_root.expanduser().resolve()
-    runtime_paths = _runtime_sources(project_root, args.runtime_config)
+    runtime_paths = _runtime_sources(
+        project_root,
+        args.runtime_config,
+        args.sofr_source,
+    )
     datasets = ("sofr", "spy-daily") if args.dataset == "all" else (args.dataset,)
+    expected_sofr_source_sha256 = args.expected_sofr_source_sha256
+    if args.sofr_source is not None and expected_sofr_source_sha256 is None:
+        raise ValueError(
+            "--expected-sofr-source-sha256 is required with --sofr-source"
+        )
+    if expected_sofr_source_sha256 is not None:
+        if args.sofr_source is None:
+            raise ValueError(
+                "--expected-sofr-source-sha256 requires --sofr-source"
+            )
+        if re.fullmatch(r"[0-9a-f]{64}", expected_sofr_source_sha256) is None:
+            raise ValueError(
+                "--expected-sofr-source-sha256 must be a lowercase SHA-256"
+            )
+        if "sofr" not in datasets:
+            raise ValueError("SOFR source assertions require the sofr dataset")
+        if sha256_file(runtime_paths["sofr_cache"]) != expected_sofr_source_sha256:
+            raise ValueError("the exact SOFR source does not match its pinned SHA-256")
 
     if args.validate_only:
         return [
@@ -158,18 +211,36 @@ def run(args: argparse.Namespace) -> list[dict[str, object]]:
             for name in datasets
         ]
 
+    require_canonical_eod_runtime_config(project_root, args.runtime_config)
+
     artifact_root = _absolute(
         args.artifact_root or Path("data/reference_history"), project_root
     )
     store = ContentAddressedArtifactStore(artifact_root)
     code_version = _code_version(project_root, args.code_version)
     requested_by = args.requested_by or os.environ.get("USERNAME") or os.environ.get("USER")
-    connection = connect_from_environment()
+    environment = args.environment
+    if (
+        not isinstance(environment, str)
+        or not environment.strip()
+        or environment != environment.strip()
+    ):
+        raise ValueError("--environment must be canonical non-empty text")
     results: list[dict[str, object]] = []
-    try:
+
+    def load_all(connection) -> None:
         for name in datasets:
             sources = _dataset_sources(name, runtime_paths)
             frozen = store.freeze_inputs(sources)
+            if (
+                name == "sofr"
+                and expected_sofr_source_sha256 is not None
+                and frozen.inputs["sofr"].content_sha256
+                != expected_sofr_source_sha256
+            ):
+                raise RuntimeError(
+                    "the frozen SOFR source does not match its pinned SHA-256"
+                )
             frozen_paths = {key: item.path for key, item in frozen.inputs.items()}
             history = _normalize(name, frozen_paths)
             store.verify_frozen_inputs(frozen)
@@ -182,7 +253,7 @@ def run(args: argparse.Namespace) -> list[dict[str, object]]:
                 connection,
                 prepared,
                 artifact_store=store,
-                environment=args.environment,
+                environment=environment,
                 code_version=code_version,
                 generation=args.generation,
                 requested_by=requested_by,
@@ -193,8 +264,36 @@ def run(args: argparse.Namespace) -> list[dict[str, object]]:
                 result.reference_data_release_id
             )
             results.append(rendered)
-    finally:
-        connection.close()
+
+    if has_delegated_finalization_lease():
+        connection = connect_from_environment()
+        try:
+            with delegated_finalization_child_lease(connection):
+                load_all(connection)
+        finally:
+            connection.close()
+    else:
+        with exclusive_eod_writer_lock(project_root):
+            audit_root = resolve_eod_audit_root(project_root, None)
+            assert_no_unresolved_eod_finalizations(audit_root)
+            connection = connect_from_environment()
+            try:
+                with standalone_finalization_lease(connection):
+                    assert_no_unresolved_eod_finalizations(audit_root)
+                    prior_evidence = completed_eod_finalization_evidence(
+                        audit_root,
+                        environment=environment,
+                    )
+                    verify_database_finalization_continuity(
+                        connection,
+                        prior_evidence,
+                    )
+                    # End the read-only continuity transaction before the
+                    # reference service begins its own atomic write.
+                    connection.rollback()
+                    load_all(connection)
+            finally:
+                connection.close()
     return results
 
 

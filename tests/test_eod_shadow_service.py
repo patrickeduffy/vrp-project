@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import tempfile
 import unittest
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -66,6 +68,21 @@ class FakeConnection:
 
     def rollback(self):
         self.rollbacks += 1
+
+
+class TrackingLoaderConnection:
+    def __init__(self, events: list[str]):
+        self.events = events
+        self.rollbacks = 0
+        self.closed = False
+
+    def rollback(self):
+        self.rollbacks += 1
+        self.events.append("rollback")
+
+    def close(self):
+        self.closed = True
+        self.events.append("close")
 
 
 @dataclass
@@ -614,6 +631,302 @@ class EodShadowServiceTests(unittest.TestCase):
                     loader_cli.run(args)
             connect.assert_not_called()
 
+    def test_standalone_mutation_rejects_run_outside_canonical_audit_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            runtime = root / "config/vrp_hybrid_v2_eod_runtime_config.json"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_text(
+                json.dumps(
+                    {"outputs": {"audit_dir": "data/audit/vrp_hybrid_v2_eod"}}
+                ),
+                encoding="utf-8",
+            )
+            run_dir = root / "data/audit/redirected/20260721_170000"
+            run_dir.mkdir(parents=True)
+            snapshot = make_snapshot(run_dir)
+            args = loader_cli.parse_args(
+                [
+                    "--project-root",
+                    str(root),
+                    "--run-dir",
+                    str(run_dir),
+                    "--environment",
+                    "test",
+                    "--code-version",
+                    CODE_VERSION,
+                    "--requested-by",
+                    "unit-test",
+                ]
+            )
+            with (
+                patch.object(loader_cli, "load_staged_eod_snapshot", return_value=snapshot),
+                patch.object(loader_cli, "connect_from_environment") as connect,
+            ):
+                with self.assertRaisesRegex(ValueError, "canonical EOD audit root"):
+                    loader_cli.run(args)
+
+            connect.assert_not_called()
+
+    def test_standalone_cli_verifies_prior_database_continuity_before_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            runtime = root / "config/vrp_hybrid_v2_eod_runtime_config.json"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_text(
+                json.dumps(
+                    {"outputs": {"audit_dir": "data/audit/vrp_hybrid_v2_eod"}}
+                ),
+                encoding="utf-8",
+            )
+            run_dir = root / "data/audit/vrp_hybrid_v2_eod/20260721_170000"
+            run_dir.mkdir(parents=True)
+            snapshot = make_snapshot(run_dir)
+            args = loader_cli.parse_args(
+                [
+                    "--project-root",
+                    str(root),
+                    "--run-dir",
+                    str(run_dir),
+                    "--environment",
+                    "test",
+                    "--code-version",
+                    CODE_VERSION,
+                    "--requested-by",
+                    "unit-test",
+                ]
+            )
+            events: list[str] = []
+            connection = TrackingLoaderConnection(events)
+            prior_evidence = (object(),)
+
+            @contextmanager
+            def writer_lock(project_root):
+                events.append("writer_lock_enter")
+                yield
+                events.append("writer_lock_exit")
+
+            @contextmanager
+            def standalone_lease(candidate):
+                self.assertIs(candidate, connection)
+                events.append("standalone_lease_enter")
+                yield
+                events.append("standalone_lease_exit")
+
+            def completed_evidence(*args, **kwargs):
+                events.append("prior_evidence")
+                self.assertEqual(kwargs["before_timestamp"], run_dir.name)
+                self.assertEqual(kwargs["environment"], "test")
+                return prior_evidence
+
+            def verify_continuity(candidate, evidence):
+                self.assertIs(candidate, connection)
+                self.assertIs(evidence, prior_evidence)
+                self.assertTrue(evidence)
+                events.append("continuity")
+
+            def execute(candidate, exact_snapshot, **kwargs):
+                self.assertIs(candidate, connection)
+                self.assertIs(exact_snapshot, snapshot)
+                events.append("mutation")
+                return SimpleNamespace(
+                    to_json_dict=lambda: {"status": "COMPLETED", "no_op": False}
+                )
+
+            with (
+                patch.object(loader_cli, "load_staged_eod_snapshot", return_value=snapshot),
+                patch.object(loader_cli, "exclusive_eod_writer_lock", writer_lock),
+                patch.object(loader_cli, "assert_no_unresolved_eod_finalizations"),
+                patch.object(
+                    loader_cli,
+                    "completed_eod_finalization_evidence",
+                    side_effect=completed_evidence,
+                ),
+                patch.object(
+                    loader_cli,
+                    "verify_database_finalization_continuity",
+                    side_effect=verify_continuity,
+                ),
+                patch.object(loader_cli, "standalone_finalization_lease", standalone_lease),
+                patch.object(loader_cli, "connect_from_environment", return_value=connection),
+                patch.object(loader_cli, "execute_eod_shadow_load", side_effect=execute),
+            ):
+                output = loader_cli.run(args)
+
+            self.assertEqual(output["status"], "COMPLETED")
+            self.assertEqual(connection.rollbacks, 1)
+            self.assertTrue(connection.closed)
+            self.assertLess(
+                events.index("standalone_lease_enter"), events.index("continuity")
+            )
+            self.assertLess(events.index("continuity"), events.index("rollback"))
+            self.assertLess(events.index("rollback"), events.index("mutation"))
+            self.assertLess(events.index("mutation"), events.index("standalone_lease_exit"))
+            self.assertLess(events.index("standalone_lease_exit"), events.index("close"))
+
+    def test_standalone_cli_continuity_failure_prevents_mutation_and_closes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            runtime = root / "config/vrp_hybrid_v2_eod_runtime_config.json"
+            runtime.parent.mkdir(parents=True)
+            runtime.write_text(
+                json.dumps(
+                    {"outputs": {"audit_dir": "data/audit/vrp_hybrid_v2_eod"}}
+                ),
+                encoding="utf-8",
+            )
+            run_dir = root / "data/audit/vrp_hybrid_v2_eod/20260721_170000"
+            run_dir.mkdir(parents=True)
+            snapshot = make_snapshot(run_dir)
+            args = loader_cli.parse_args(
+                [
+                    "--project-root",
+                    str(root),
+                    "--run-dir",
+                    str(run_dir),
+                    "--environment",
+                    "test",
+                    "--code-version",
+                    CODE_VERSION,
+                    "--requested-by",
+                    "unit-test",
+                ]
+            )
+            events: list[str] = []
+            connection = TrackingLoaderConnection(events)
+            prior_evidence = (object(),)
+
+            @contextmanager
+            def writer_lock(project_root):
+                yield
+
+            @contextmanager
+            def standalone_lease(candidate):
+                self.assertIs(candidate, connection)
+                events.append("standalone_lease_enter")
+                try:
+                    yield
+                finally:
+                    events.append("standalone_lease_exit")
+
+            def reject_continuity(candidate, evidence):
+                self.assertIs(candidate, connection)
+                self.assertIs(evidence, prior_evidence)
+                events.append("continuity")
+                raise RuntimeError("prior PostgreSQL projection is incomplete")
+
+            with (
+                patch.object(loader_cli, "load_staged_eod_snapshot", return_value=snapshot),
+                patch.object(loader_cli, "exclusive_eod_writer_lock", writer_lock),
+                patch.object(loader_cli, "assert_no_unresolved_eod_finalizations"),
+                patch.object(
+                    loader_cli,
+                    "completed_eod_finalization_evidence",
+                    return_value=prior_evidence,
+                ),
+                patch.object(
+                    loader_cli,
+                    "verify_database_finalization_continuity",
+                    side_effect=reject_continuity,
+                ),
+                patch.object(loader_cli, "standalone_finalization_lease", standalone_lease),
+                patch.object(loader_cli, "connect_from_environment", return_value=connection),
+                patch.object(loader_cli, "execute_eod_shadow_load") as execute,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "projection is incomplete"):
+                    loader_cli.run(args)
+
+            execute.assert_not_called()
+            self.assertEqual(connection.rollbacks, 0)
+            self.assertTrue(connection.closed)
+            self.assertEqual(
+                events,
+                [
+                    "standalone_lease_enter",
+                    "continuity",
+                    "standalone_lease_exit",
+                    "close",
+                ],
+            )
+
+    def test_cli_rejects_changed_snapshot_content_before_connecting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            snapshot = make_snapshot(root)
+            args = loader_cli.parse_args(
+                [
+                    "--project-root",
+                    str(root),
+                    "--run-dir",
+                    str(root),
+                    "--expected-content-sha256",
+                    "0" * 64,
+                    "--environment",
+                    "test",
+                    "--code-version",
+                    CODE_VERSION,
+                    "--requested-by",
+                    "unit-test",
+                ]
+            )
+            with (
+                patch.object(
+                    loader_cli,
+                    "load_staged_eod_snapshot",
+                    return_value=snapshot,
+                ),
+                patch.object(loader_cli, "connect_from_environment") as connect,
+            ):
+                with self.assertRaisesRegex(ValueError, "caller-pinned content"):
+                    loader_cli.run(args)
+            connect.assert_not_called()
+
+    def test_cli_rejects_source_bundle_drift_before_connecting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            snapshot = make_snapshot(root)
+            expected = "6" * 64
+            args = loader_cli.parse_args(
+                [
+                    "--project-root",
+                    str(root),
+                    "--run-dir",
+                    str(root),
+                    "--expected-source-bundle-sha256",
+                    expected,
+                    "--environment",
+                    "test",
+                    "--code-version",
+                    CODE_VERSION,
+                    "--requested-by",
+                    "unit-test",
+                ]
+            )
+            before = SimpleNamespace(
+                content_sha256=expected,
+                artifact_sha256={"signal_history": "1" * 64},
+            )
+            after = SimpleNamespace(
+                content_sha256="7" * 64,
+                artifact_sha256={"signal_history": "2" * 64},
+            )
+            with (
+                patch.object(
+                    loader_cli,
+                    "load_eod_source_bundle",
+                    side_effect=(before, after),
+                ),
+                patch.object(
+                    loader_cli,
+                    "load_staged_eod_snapshot",
+                    return_value=snapshot,
+                ),
+                patch.object(loader_cli, "connect_from_environment") as connect,
+            ):
+                with self.assertRaisesRegex(ValueError, "changed"):
+                    loader_cli.run(args)
+            connect.assert_not_called()
+
     def test_atomic_load_then_retry_is_a_revalidated_no_op(self):
         with tempfile.TemporaryDirectory() as directory:
             snapshot = make_snapshot(Path(directory).resolve())
@@ -639,6 +952,14 @@ class EodShadowServiceTests(unittest.TestCase):
             self.assertFalse(first.no_op)
             self.assertTrue(second.no_op)
             self.assertEqual(first.pipeline_run_id, second.pipeline_run_id)
+            self.assertEqual(
+                first.database_projection_sha256,
+                second.database_projection_sha256,
+            )
+            self.assertEqual(
+                first.database_readback_sha256,
+                second.database_readback_sha256,
+            )
             self.assertEqual(connection.commits, 2)
             self.assertEqual(connection.rollbacks, 0)
             self.assertEqual(repository.events.count("begin"), 1)

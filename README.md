@@ -15,8 +15,15 @@ ThetaData + SOFR
     -> Hybrid v2 signal publisher
     -> canonical outputs
     -> production health check
+    -> exact completed-run handoff
+    -> PostgreSQL reference sync and reconciled EOD shadow
+    -> finalization status in the EOD audit directory
     -> Streamlit display
 ```
+
+The canonical file result remains authoritative. The PostgreSQL step is an
+automatic, non-authoritative shadow comparison and does not insert a row into
+`vrp.signal_publications`.
 
 The July 2026 EOD audit repair is part of the production contract:
 
@@ -32,8 +39,10 @@ The accepted repair baseline is through 2026-07-16. Normal production runs advan
 ## Active production entry points
 
 - `scripts/run_eod.py` — stable production-facing EOD entry point
+- `scripts/finalize_eod_postgres.py` — exact-run PostgreSQL finalization retry
 - `scripts/golden_eod.py` — golden-output capture and reconciliation
 - `scripts/load_reference_history.py` — validated, revision-safe SOFR/SPY historical backfill
+- `scripts/load_eod_snapshot.py` — low-level EOD shadow validation and load
 - `notebooks/vrp_hybrid_v2_eod_pipeline.py` — EOD orchestrator
 - `notebooks/vrp_hybrid_v2_signal_publish.py` — locked signal, sizing, and selection logic
 - `notebooks/vrp_hybrid_v2_health_check.py` — production data and contract validation
@@ -52,14 +61,38 @@ python scripts\run_eod.py `
   --approved-nav 1000000
 ```
 
-The stable entry point currently delegates to the accepted notebook-era orchestrator. This preserves the locked calculations while production modules are migrated incrementally. Add `--dry-run` to inspect the delegated command without executing it.
+Set `VRP_DATABASE_URL` in the invoking process before a normal published run.
+The stable entry point delegates the locked calculations to the accepted
+notebook-era orchestrator, then automatically synchronizes compact reference
+history and reconciles that exact completed run into PostgreSQL. Add
+`--dry-run` to inspect the delegated command and post-pass policy without
+executing either step.
+
+The wrapper holds a project-wide operation lock across the file run and the
+database post-pass. It also stops before a new production run when an older
+published run marked as requiring PostgreSQL finalization remains unresolved,
+or when recomputing that prior run's PostgreSQL read-back fingerprint finds
+missing or changed data. The obligation queue remains fixed at
+`data/audit/vrp_hybrid_v2_eod` so configuration drift cannot hide older debt.
+Resolve such runs oldest-first with `scripts/finalize_eod_postgres.py`.
 
 Useful diagnostic options:
 
 - `--target-date YYYYMMDD`
 - `--force-recalculate`
-- `--skip-upstream`
 - `--no-publish`
+- `--skip-upstream --no-publish`
+- `--no-postgres-shadow`
+
+`--skip-upstream` is diagnostic-only and is rejected unless `--no-publish` is
+also supplied. `--no-postgres-shadow` deliberately publishes only the file
+result (unless paired with `--no-publish`); it does not require
+`VRP_DATABASE_URL`, does not waive older unresolved finalizations, and does not
+mark the new run for later automatic finalization. It is a break-glass bypass,
+not the way to retry a failed post-pass. A published bypass is explicitly
+recorded as `postgres_postpass_bypass_reason: explicit-no-postgres-shadow`;
+direct legacy publication without either the normal obligation or that audited
+bypass is rejected before the model pipeline starts.
 
 ## Run the health check
 
@@ -93,8 +126,12 @@ python scripts\load_reference_history.py all `
   --validate-only
 ```
 
-Database loading is a separate, explicit step documented in
-[`docs/REFERENCE_DATA_STORAGE.md`](docs/REFERENCE_DATA_STORAGE.md).
+Normal published EOD runs perform the database synchronization automatically.
+Standalone mutating loaders are administrative tools: they use the same
+project and database coordination gates and cannot advance past unresolved EOD
+finalization debt. See
+[`docs/REFERENCE_DATA_STORAGE.md`](docs/REFERENCE_DATA_STORAGE.md) and
+[`docs/EOD_POSTGRES_SHADOW.md`](docs/EOD_POSTGRES_SHADOW.md).
 
 ## Launch the dashboard
 
@@ -130,7 +167,11 @@ The repository intentionally excludes:
 
 These remain on the production computer and are covered by `.gitignore`.
 
-The planned storage boundary is Parquet for immutable raw and standardized market data, PostgreSQL for operational state and published signal outputs, and DuckDB for research queries over Parquet. See [`docs/DATABASE_ARCHITECTURE.md`](docs/DATABASE_ARCHITECTURE.md).
+The storage boundary is Parquet for immutable raw and standardized market data,
+PostgreSQL for compact reference history and reconciled operational shadow
+state, and DuckDB for research queries over Parquet. Database signal
+publication remains disabled until a separately approved cutover. See
+[`docs/DATABASE_ARCHITECTURE.md`](docs/DATABASE_ARCHITECTURE.md).
 
 ## Documentation
 
