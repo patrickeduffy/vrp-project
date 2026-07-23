@@ -61,7 +61,7 @@ def run_pipeline(
     force_recalculate: bool,
     skip_upstream: bool,
 ) -> tuple[int, str]:
-    script = Path(__file__).with_name("vrp_hybrid_v2_eod_pipeline.py")
+    script = Path(__file__).resolve().parents[1] / "scripts" / "run_eod.py"
     command = [
         sys.executable,
         "-u",
@@ -78,7 +78,7 @@ def run_pipeline(
     if force_recalculate:
         command.append("--force-recalculate")
     if skip_upstream:
-        command.append("--skip-upstream")
+        command.extend(["--skip-upstream", "--no-publish"])
 
     progress_bar = st.progress(0, text="Starting production refresh…")
     status_line = st.empty()
@@ -109,11 +109,21 @@ def run_pipeline(
     return_code = process.wait()
     output = "\n".join(lines)
     if return_code == 0:
-        progress_bar.progress(100, text="Refresh completed and published.")
-        status_line.success("PASS — latest completed EOD signal is published.")
+        if skip_upstream:
+            progress_bar.progress(100, text="Diagnostic refresh completed; not published.")
+            status_line.success("PASS — diagnostic completed without publication.")
+        else:
+            progress_bar.progress(100, text="Refresh and database shadow completed.")
+            status_line.success(
+                "PASS — latest EOD signal and PostgreSQL shadow are complete."
+            )
     else:
-        progress_bar.progress(100, text="Refresh failed — canonical outputs were not retained.")
-        status_line.error("FAILED — NOT PUBLISHED. Review the run console and audit directory.")
+        progress_bar.progress(100, text="Refresh did not complete.")
+        status_line.error(
+            "FAILED. Review the run console and audit directory. If the file EOD "
+            "stage passed, its canonical outputs remain retained even when the "
+            "PostgreSQL post-pass fails."
+        )
     return return_code, output
 
 

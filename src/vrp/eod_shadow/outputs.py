@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1120,6 +1121,7 @@ def load_staged_eod_snapshot(
     source_root: Path,
     *,
     fixture_path: Path | None = None,
+    expected_run_manifest_sha256: str | None = None,
     zscore_atol: float = 1e-12,
     zscore_rtol: float = 1e-10,
 ) -> EodSnapshot:
@@ -1143,6 +1145,11 @@ def load_staged_eod_snapshot(
         if not path.is_file():
             _fail(f"missing fixed {name} artifact: {path}")
     initial_hashes = {name: _hash(path) for name, path in fixed_paths.items()}
+    if expected_run_manifest_sha256 is not None:
+        if re.fullmatch(r"[0-9a-f]{64}", expected_run_manifest_sha256) is None:
+            _fail("expected run-manifest digest must be a lowercase SHA-256")
+        if initial_hashes["run_manifest"] != expected_run_manifest_sha256:
+            _fail("run manifest does not match the caller-pinned digest")
 
     run_manifest = _read_json(fixed_paths["run_manifest"], "run manifest")
     publish_manifest = _read_json(fixed_paths["publish_manifest"], "publish manifest")

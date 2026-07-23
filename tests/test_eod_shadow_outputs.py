@@ -513,6 +513,18 @@ class StagedEodOutputTests(unittest.TestCase):
                 load_staged_eod_snapshot(run, self.root, fixture_path=self.fixture)
         read.assert_not_called()
 
+    def test_rejects_a_run_manifest_that_disagrees_with_the_caller_pin(self):
+        run = self._run_dir()
+        with patch("vrp.eod_shadow.outputs.pd.read_parquet") as read:
+            with self.assertRaisesRegex(EodOutputContractError, "caller-pinned"):
+                load_staged_eod_snapshot(
+                    run,
+                    self.root,
+                    fixture_path=self.fixture,
+                    expected_run_manifest_sha256="0" * 64,
+                )
+        read.assert_not_called()
+
     def test_content_identity_excludes_run_paths_and_timestamps(self):
         first = self._load(self._run_dir("first"))
         second_run = self._run_dir("second")

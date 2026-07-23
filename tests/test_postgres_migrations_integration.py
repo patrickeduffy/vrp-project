@@ -9,6 +9,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 from uuid import uuid4
@@ -59,6 +60,19 @@ from vrp.eod_shadow.models import (
 from vrp.eod_shadow.sofr_evidence import SofrUpdaterEvidence
 from vrp.eod_shadow.service import execute_eod_shadow_load
 from vrp.storage.eod_postgres import PostgresEodRepository
+from vrp.orchestration.eod_finalization_gate import CompletedEodFinalizationEvidence
+from vrp.storage.finalization_coordination import (
+    FINALIZATION_LEASE_TOKEN_ENV,
+    GLOBAL_FINALIZATION_ADVISORY_KEY,
+    FinalizationCoordinationError,
+    delegated_finalization_child_lease,
+    standalone_finalization_lease,
+    token_advisory_key,
+)
+from vrp.storage.finalization_continuity import (
+    DatabaseFinalizationContinuityError,
+    verify_database_finalization_continuity,
+)
 
 
 def local_path_from_file_uri(uri: str) -> Path:
@@ -113,6 +127,31 @@ def synthetic_eod_snapshot(root: Path) -> EodSnapshot:
     sofr_snapshot_bytes = b"observation_date,SOFR\n2030-01-03,3.57\n"
     sofr_snapshot_sha256 = _write_version_document(
         sofr_snapshot_path, sofr_snapshot_bytes
+    )
+    run_manifest = {
+        "status": "PASS",
+        "finished_at": "2030-01-04T21:05:00+00:00",
+    }
+    run_manifest_path = run_dir / "run_manifest.json"
+    run_manifest_bytes = json.dumps(
+        run_manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    run_manifest_sha256 = _write_version_document(
+        run_manifest_path,
+        run_manifest_bytes,
+    )
+    publish_manifest = {"status": "PASS", "authoritative": False}
+    publish_manifest_path = staging / "vrp_hybrid_v2_publish_manifest.json"
+    publish_manifest_bytes = json.dumps(
+        publish_manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    publish_manifest_sha256 = _write_version_document(
+        publish_manifest_path,
+        publish_manifest_bytes,
     )
 
     implied = tuple(
@@ -193,11 +232,8 @@ def synthetic_eod_snapshot(root: Path) -> EodSnapshot:
         valuation_date=valuation_date,
         lock_id="synthetic-eod-lock-v1",
         approved_nav=1_000_000.0,
-        run_manifest={
-            "status": "PASS",
-            "finished_at": "2030-01-04T21:05:00+00:00",
-        },
-        publish_manifest={"status": "PASS", "authoritative": False},
+        run_manifest=run_manifest,
+        publish_manifest=publish_manifest,
         model_identity=VersionedDocument(
             key="unified_fds_no_min_return",
             version_label="synthetic-locked-v1",
@@ -283,6 +319,26 @@ def synthetic_eod_snapshot(root: Path) -> EodSnapshot:
                 metadata={"synthetic": True},
                 trade_date_start=date(2030, 1, 3),
                 trade_date_end=date(2030, 1, 3),
+            ),
+            ArtifactMetadata(
+                logical_name="run_manifest",
+                path=run_manifest_path.resolve(),
+                asset_format="JSON",
+                sha256=run_manifest_sha256,
+                byte_size=len(run_manifest_bytes),
+                relative_path="run_manifest.json",
+                identity_input=False,
+                metadata={"synthetic": True},
+            ),
+            ArtifactMetadata(
+                logical_name="publish_manifest",
+                path=publish_manifest_path.resolve(),
+                asset_format="JSON",
+                sha256=publish_manifest_sha256,
+                byte_size=len(publish_manifest_bytes),
+                relative_path="staging/vrp_hybrid_v2_publish_manifest.json",
+                identity_input=False,
+                metadata={"synthetic": True},
             ),
         ),
         golden_evidence=GoldenVerificationEvidence(
@@ -598,6 +654,67 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
                     self.assertEqual(cursor.fetchone()[0], "America/New_York")
                 eod_connection.rollback()
 
+                continuity = CompletedEodFinalizationEvidence(
+                    run_dir=Path("/synthetic/eod/20260721_170000"),
+                    pipeline_run_id=str(first.pipeline_run_id),
+                    market_snapshot_id=str(first.market_snapshot_id),
+                    selected_signal_id=str(first.selected_signal_id),
+                    environment="integration-eod-shadow",
+                    code_version=EOD_TEST_CODE_VERSION,
+                    snapshot_content_sha256=snapshot.content_sha256,
+                    database_projection_sha256=(
+                        first.database_projection_sha256
+                    ),
+                    database_readback_sha256=first.database_readback_sha256,
+                    run_manifest_sha256=next(
+                        artifact.sha256
+                        for artifact in snapshot.artifacts
+                        if artifact.logical_name == "run_manifest"
+                    ),
+                    source_bundle_sha256="b" * 64,
+                )
+                verify_database_finalization_continuity(
+                    eod_connection,
+                    [continuity],
+                )
+                missing_selected = CompletedEodFinalizationEvidence(
+                    **{
+                        **continuity.__dict__,
+                        "selected_signal_id": str(uuid4()),
+                    }
+                )
+                with self.assertRaises(DatabaseFinalizationContinuityError):
+                    verify_database_finalization_continuity(
+                        eod_connection,
+                        [missing_selected],
+                    )
+                eod_connection.rollback()
+
+                with eod_connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        UPDATE vrp.implied_variance_term_structure
+                        SET annualized_variance = annualized_variance + 0.000001
+                        WHERE pipeline_run_id = %s
+                          AND tenor_days = 9
+                        """,
+                        (first.pipeline_run_id,),
+                    )
+                with self.assertRaisesRegex(
+                    DatabaseFinalizationContinuityError,
+                    "has changed since",
+                ):
+                    verify_database_finalization_continuity(
+                        eod_connection,
+                        [continuity],
+                    )
+                eod_connection.rollback()
+                verify_database_finalization_continuity(
+                    eod_connection,
+                    [continuity],
+                )
+                eod_connection.rollback()
+
                 with self.connection.cursor() as cursor:
                     cursor.execute(
                         """
@@ -749,6 +866,67 @@ class PostgresMigrationIntegrationTests(unittest.TestCase):
         with self.connection.cursor() as cursor:
             cursor.execute("SELECT version FROM vrp.schema_migrations ORDER BY version")
             self.assertEqual([row[0] for row in cursor.fetchall()], ["0001", "0002"])
+
+    def test_finalization_coordination_survives_parent_session_loss(self):
+        token = "f" * 64
+        token_key = token_advisory_key(token)
+
+        parent = None
+        child = None
+        standalone = None
+        try:
+            parent = psycopg.connect(TEST_DSN, autocommit=True)
+            child = psycopg.connect(TEST_DSN, autocommit=True)
+            standalone = psycopg.connect(TEST_DSN, autocommit=True)
+            with parent.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_try_advisory_lock(%s)",
+                    (GLOBAL_FINALIZATION_ADVISORY_KEY,),
+                )
+                self.assertTrue(cursor.fetchone()[0])
+                cursor.execute(
+                    "SELECT pg_try_advisory_lock(%s)",
+                    (token_key,),
+                )
+                self.assertTrue(cursor.fetchone()[0])
+
+            with patch.dict(
+                os.environ,
+                {FINALIZATION_LEASE_TOKEN_ENV: token},
+                clear=False,
+            ):
+                with delegated_finalization_child_lease(child) as proven_token:
+                    self.assertEqual(proven_token, token)
+
+                    with self.assertRaisesRegex(
+                        FinalizationCoordinationError,
+                        "already running",
+                    ):
+                        with standalone_finalization_lease(standalone):
+                            self.fail(
+                                "standalone writer overlapped the active parent"
+                            )
+
+                    # PostgreSQL releases the parent's session locks here, but
+                    # the delegated child must remain an observable writer.
+                    parent.close()
+                    with self.assertRaisesRegex(
+                        FinalizationCoordinationError,
+                        "still active",
+                    ):
+                        with standalone_finalization_lease(standalone):
+                            self.fail(
+                                "replacement writer overlapped the orphaned child"
+                            )
+
+            standalone_succeeded = False
+            with standalone_finalization_lease(standalone):
+                standalone_succeeded = True
+            self.assertTrue(standalone_succeeded)
+        finally:
+            for connection in (parent, child, standalone):
+                if connection is not None and not connection.closed:
+                    connection.close()
 
     def test_historical_loader_is_idempotent_revision_safe_and_atomic(self):
         def prepared_sofr(store, source, rows):

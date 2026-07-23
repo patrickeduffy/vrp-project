@@ -52,6 +52,8 @@ class EodShadowLoadResult:
     valuation_date: date
     snapshot_at: datetime
     content_sha256: str
+    database_projection_sha256: str
+    database_readback_sha256: str
     implied_variance_count: int
     forecast_variance_count: int
     signal_feature_count: int
@@ -62,6 +64,8 @@ class EodShadowLoadResult:
     def to_json_dict(self) -> dict[str, Any]:
         return {
             "content_sha256": self.content_sha256,
+            "database_projection_sha256": self.database_projection_sha256,
+            "database_readback_sha256": self.database_readback_sha256,
             "decision": self.decision,
             "forecast_variance_count": self.forecast_variance_count,
             "implied_variance_count": self.implied_variance_count,
@@ -138,6 +142,14 @@ def _canonical_bytes(value: Mapping[str, Any]) -> bytes:
 
 def _digest(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def database_readback_fingerprint(projection: Mapping[str, Any]) -> str:
+    """Hash the PostgreSQL-decoded projection exactly as later reads see it."""
+
+    if not isinstance(projection, Mapping):
+        raise ValueError("database projection must be a mapping")
+    return _digest({"database_projection": _projection_value(projection)})
 
 
 def _stable_id(kind: str, *parts: object) -> UUID:
@@ -1118,6 +1130,8 @@ def _result(
     ids: _Identifiers,
     *,
     effective_input_sha256: str,
+    database_projection_sha256: str,
+    database_readback_sha256: str,
     no_op: bool,
 ) -> EodShadowLoadResult:
     return EodShadowLoadResult(
@@ -1127,6 +1141,8 @@ def _result(
         valuation_date=snapshot.valuation_date,
         snapshot_at=snapshot.snapshot_at,
         content_sha256=effective_input_sha256,
+        database_projection_sha256=database_projection_sha256,
+        database_readback_sha256=database_readback_sha256,
         implied_variance_count=len(snapshot.implied_variance),
         forecast_variance_count=len(snapshot.forecast_variance),
         signal_feature_count=len(snapshot.signal_features),
@@ -1386,6 +1402,7 @@ def execute_eod_shadow_load(
                 )
                 _assert_projection(expected, _projection_value(actual))
                 output_fingerprint = _digest({"database_projection": expected})
+                readback_fingerprint = database_readback_fingerprint(actual)
                 _assert_completed_evidence(
                     repository,
                     ids.pipeline_run_id,
@@ -1397,6 +1414,8 @@ def execute_eod_shadow_load(
                     snapshot,
                     ids,
                     effective_input_sha256=effective_input_sha256,
+                    database_projection_sha256=output_fingerprint,
+                    database_readback_sha256=readback_fingerprint,
                     no_op=True,
                 )
             else:
@@ -1507,6 +1526,9 @@ def execute_eod_shadow_load(
                 repository.finalize_run(ids.pipeline_run_id)
                 final_projection = repository.fetch_run_projection(ids.pipeline_run_id)
                 _assert_projection(expected, _projection_value(final_projection))
+                readback_fingerprint = database_readback_fingerprint(
+                    final_projection
+                )
                 _assert_completed_evidence(
                     repository,
                     ids.pipeline_run_id,
@@ -1518,6 +1540,8 @@ def execute_eod_shadow_load(
                     snapshot,
                     ids,
                     effective_input_sha256=effective_input_sha256,
+                    database_projection_sha256=output_fingerprint,
+                    database_readback_sha256=readback_fingerprint,
                     no_op=False,
                 )
         # Close the validation-to-write window as tightly as possible.  A file

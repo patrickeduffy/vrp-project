@@ -6,12 +6,28 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPOSITORY_ROOT / "src"))
+
 import pandas as pd
+
+from vrp.orchestration.eod import resolve_clean_code_version
+from vrp.orchestration.eod_bundle import load_eod_source_bundle
+from vrp.orchestration.eod_finalization_gate import (
+    assert_no_unresolved_eod_finalizations,
+    require_canonical_eod_runtime_config,
+    resolve_eod_audit_root,
+)
+from vrp.orchestration.eod_lock import (
+    eod_writer_execution_lock,
+    exclusive_eod_canonical_writer_lock,
+)
 
 from vrp_hybrid_v2_common import (
     DEFAULT_PROJECT_ROOT,
@@ -32,12 +48,18 @@ from vrp_hybrid_v2_common import (
     read_table,
     resolve_path,
     restore_files,
+    sha256_file,
     utc_now_iso,
     write_csv_atomic,
     write_json,
     write_parquet_atomic,
 )
 from vrp_hybrid_v2_health_check import HealthConfig, run_health_check
+
+
+RESULT_HANDOFF_CONTRACT = "vrp.hybrid_v2.eod_result"
+RESULT_HANDOFF_SCHEMA_VERSION = 1
+RESULT_HANDOFF_WRITE_FAILED_EXIT_CODE = 3
 
 
 @dataclass(frozen=True)
@@ -50,6 +72,10 @@ class PipelineConfig:
     force_recalculate: bool
     recalc_start_override: pd.Timestamp | None
     publish: bool
+    code_version: str | None
+    postgres_postpass_required: bool
+    postgres_environment: str | None
+    postgres_postpass_bypass_reason: str | None
     run_timestamp: str
     run_dir: Path
 
@@ -72,7 +98,136 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--no-publish", action="store_true")
+    parser.add_argument(
+        "--code-version",
+        default=None,
+        help=(
+            "Optional full Git SHA assertion. Published runs always resolve and "
+            "record the exact clean producing commit."
+        ),
+    )
+    parser.add_argument(
+        "--postgres-postpass-required",
+        action="store_true",
+        help="Record that this published file run requires the automatic DB post-pass.",
+    )
+    parser.add_argument("--postgres-environment", default=None)
+    parser.add_argument(
+        "--postgres-postpass-bypass-reason",
+        choices=("explicit-no-postgres-shadow",),
+        default=None,
+        help="Audit an explicit wrapper-approved file-only publication.",
+    )
+    parser.add_argument(
+        "--result-handoff",
+        type=Path,
+        default=None,
+        help=(
+            "Optional caller-owned JSON path that is atomically created only "
+            "after the completed EOD run has passed."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def build_result_handoff(
+    config: PipelineConfig,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the exact completed-run contract consumed by the outer launcher."""
+
+    run_dir = config.run_dir.resolve(strict=True)
+    manifest_path = (run_dir / "run_manifest.json").resolve(strict=True)
+    disk_manifest = load_json(manifest_path)
+
+    if manifest.get("status") != "PASS" or disk_manifest.get("status") != "PASS":
+        raise RuntimeError("result handoff requires an in-memory and on-disk PASS manifest")
+    if manifest != disk_manifest:
+        raise RuntimeError("in-memory and on-disk completed-run manifests disagree")
+
+    target_date = str(config.target_date.date())
+    if disk_manifest.get("target_date") != target_date:
+        raise RuntimeError("completed-run manifest target date disagrees with the run configuration")
+    if disk_manifest.get("final_health") != "PASS":
+        raise RuntimeError("result handoff requires final_health=PASS")
+
+    published_outputs = disk_manifest.get("published_outputs")
+    if not isinstance(published_outputs, dict):
+        raise RuntimeError("completed-run manifest published_outputs must be an object")
+    actually_published = bool(published_outputs)
+    if actually_published != bool(config.publish):
+        raise RuntimeError("completed-run publication evidence disagrees with the run configuration")
+
+    source_bundle = load_eod_source_bundle(run_dir)
+    return {
+        "contract": RESULT_HANDOFF_CONTRACT,
+        "schema_version": RESULT_HANDOFF_SCHEMA_VERSION,
+        "status": "PASS",
+        "target_date": target_date,
+        "code_version": disk_manifest.get("code_version"),
+        "postgres_postpass_required": disk_manifest.get(
+            "postgres_postpass_required"
+        ),
+        "postgres_environment": disk_manifest.get("postgres_environment"),
+        "run_dir": str(run_dir),
+        "run_manifest": {
+            "path": str(manifest_path),
+            "sha256": sha256_file(manifest_path),
+        },
+        "source_bundle": source_bundle.to_json_dict(),
+        "published": actually_published,
+    }
+
+
+def write_result_handoff(
+    destination: Path,
+    config: PipelineConfig,
+    manifest: dict[str, Any],
+) -> Path:
+    """Atomically publish one completed-run handoff without changing run evidence."""
+
+    destination = destination.expanduser()
+    if not destination.is_absolute():
+        destination = Path.cwd() / destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = destination.parent.resolve() / destination.name
+    if os.path.lexists(destination):
+        raise FileExistsError(
+            f"result handoff destination already exists; refusing to replace it: {destination}"
+        )
+    payload = build_result_handoff(config, manifest)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=str(destination.parent),
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            descriptor = -1
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary_path, destination)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
+    return destination
+
+
+def claim_run_directory(run_dir: Path) -> Path:
+    """Atomically reserve one audit directory; concurrent runs may not share it."""
+
+    run_dir = run_dir.resolve()
+    try:
+        run_dir.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"EOD audit directory already exists; refusing to reuse it: {run_dir}"
+        ) from exc
+    return run_dir
 
 
 def parse_target(value: str | None, close_buffer: int) -> pd.Timestamp:
@@ -383,8 +538,8 @@ def pipeline(config: PipelineConfig) -> dict[str, Any]:
     log_dir = audit_dir / "logs"
     staging_dir = audit_dir / "staging"
     backup_dir = audit_dir / "backups"
-    audit_dir.mkdir(parents=True, exist_ok=True)
-    staging_dir.mkdir(parents=True, exist_ok=True)
+    claim_run_directory(audit_dir)
+    staging_dir.mkdir()
     step_rows: list[dict[str, Any]] = []
 
     lock_path = resolve_path(config.project_root, runtime["canonical"]["production_config"])
@@ -487,6 +642,12 @@ def pipeline(config: PipelineConfig) -> dict[str, Any]:
         "runtime_config": str(runtime_path),
         "target_date": str(config.target_date.date()),
         "approved_nav": config.approved_nav,
+        "code_version": config.code_version,
+        "postgres_postpass_required": config.postgres_postpass_required,
+        "postgres_environment": config.postgres_environment,
+        "postgres_postpass_bypass_reason": (
+            config.postgres_postpass_bypass_reason
+        ),
         "skip_upstream": config.skip_upstream,
         "force_recalculate": config.force_recalculate,
         "recalc_start_override": (
@@ -705,6 +866,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime_path = args.runtime_config.resolve() if args.runtime_config else project_root / "config/vrp_hybrid_v2_eod_runtime_config.json"
     runtime, _ = load_runtime_config(project_root, runtime_path)
     target = parse_target(args.target_date, int(runtime.get("close_buffer_minutes", 15)))
+    if bool(args.postgres_postpass_required) != bool(args.postgres_environment):
+        raise ValueError(
+            "--postgres-postpass-required and --postgres-environment must be supplied together"
+        )
+    if (
+        isinstance(args.postgres_environment, str)
+        and args.postgres_environment != args.postgres_environment.strip()
+    ):
+        raise ValueError("--postgres-environment may not contain surrounding whitespace")
+    if bool(args.postgres_postpass_required) and args.postgres_postpass_bypass_reason:
+        raise ValueError("the PostgreSQL post-pass cannot be required and bypassed")
+    code_version = None
+    if not bool(args.no_publish) or args.code_version is not None:
+        code_version = resolve_clean_code_version(
+            source_root=REPOSITORY_ROOT,
+            project_root=project_root,
+            explicit=args.code_version,
+        )
     recalc_start_override = (
         pd.Timestamp(pd.to_datetime(args.recalc_start, errors="raise")).normalize()
         if args.recalc_start
@@ -722,9 +901,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         force_recalculate=bool(args.force_recalculate),
         recalc_start_override=recalc_start_override,
         publish=not bool(args.no_publish),
+        code_version=code_version,
+        postgres_postpass_required=bool(args.postgres_postpass_required),
+        postgres_environment=args.postgres_environment,
+        postgres_postpass_bypass_reason=args.postgres_postpass_bypass_reason,
         run_timestamp=stamp,
         run_dir=run_dir,
     )
+    if config.publish and config.skip_upstream:
+        raise ValueError("--skip-upstream may only be used with --no-publish")
+    if config.publish and not config.postgres_postpass_required and (
+        config.postgres_postpass_bypass_reason != "explicit-no-postgres-shadow"
+    ):
+        raise ValueError(
+            "published EOD requires the PostgreSQL post-pass unless the stable "
+            "wrapper records an explicit bypass"
+        )
+    if not config.publish and config.postgres_postpass_bypass_reason is not None:
+        raise ValueError("a no-publish diagnostic cannot record a publication bypass")
+    if config.publish or not config.skip_upstream:
+        require_canonical_eod_runtime_config(project_root, runtime_path)
     print("=" * 110)
     print("VRP Hybrid v2 EOD pipeline")
     print("=" * 110)
@@ -741,7 +937,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"Audit directory:   {run_dir}")
     print(f"Publish:           {config.publish}")
-    manifest = pipeline(config)
+    with eod_writer_execution_lock(project_root):
+        if config.publish or not config.skip_upstream:
+            assert_no_unresolved_eod_finalizations(
+                resolve_eod_audit_root(project_root, None)
+            )
+        with exclusive_eod_canonical_writer_lock(project_root):
+            manifest = pipeline(config)
+            if args.result_handoff is not None:
+                try:
+                    handoff_path = write_result_handoff(
+                        args.result_handoff,
+                        config,
+                        manifest,
+                    )
+                except Exception as exc:
+                    print(
+                        "PASS - Hybrid v2 EOD pipeline completed, but the result "
+                        f"handoff failed: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    print(
+                        f"Healthy run retained at: {config.run_dir.resolve()}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return RESULT_HANDOFF_WRITE_FAILED_EXIT_CODE
+                print(f"Result handoff:    {handoff_path}")
     print("=" * 110)
     print("PASS — Hybrid v2 EOD pipeline completed.")
     print(f"Manifest: {run_dir / 'run_manifest.json'}")
