@@ -8,6 +8,7 @@ credentials*.json
 secrets*.json
 secrets*.yaml
 secrets*.yml
+**/.streamlit/secrets.toml
 *.pem
 *.key
 
@@ -22,6 +23,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
 
 # ============================================================
 # Jupyter temporary files
@@ -55,6 +62,9 @@ logs/
 *.log
 *.tmp
 *.temp
+build/
+dist/
+*.egg-info/
 Thumbs.db
 .DS_Store
 

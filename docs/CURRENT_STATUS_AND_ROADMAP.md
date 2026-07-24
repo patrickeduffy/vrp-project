@@ -4,7 +4,7 @@
 
 The locked Hybrid v2 put-sleeve methodology and repaired completed-EOD calculation path are the accepted production baseline.
 
-- Canonical history is current through 2026-07-22.
+- Canonical history is current through 2026-07-23.
 - The July 2026 source, SOFR, expiration-clock, and Wilder-RSI repairs are accepted.
 - The existing EOD regression suite passes.
 - Original model-baseline tag: `eod-v2-production-baseline-2026-07-21`.
@@ -37,12 +37,17 @@ Completed foundation increments:
   and keeps database credentials out of commands and audit status;
 - separate least-privilege PostgreSQL capability roles for reference history
   and EOD snapshots, with no database publication authority.
+- separate local LOGIN accounts for those capabilities, authenticated through
+  a protected local PostgreSQL password file rather than credentials in Git;
+- a successful integrated 2026-07-23 Streamlit run from clean commit
+  `40ab31f6dc43c36539fa43723b5baad74e5f6d73`, with the canonical pipeline and
+  the automatic post-publication PostgreSQL shadow both reporting `PASS`.
 
 The local durable database and one-run shadow reconciliation gate have passed.
-The opt-in orchestration and role contracts are implemented. The next gate is
-to provision separate local LOGIN accounts, exercise one controlled integrated
-run, and accept repeated daily file-versus-database comparisons. PostgreSQL
-remains non-authoritative throughout that observation period.
+The orchestration, separate LOGIN accounts, role contracts, and first
+controlled integrated run are accepted. The current gate is a short observation
+period of repeated daily file-versus-database comparisons. PostgreSQL remains
+non-authoritative throughout that observation period.
 
 1. Preserve accepted production outputs as golden cases.
 2. Introduce stable `src/vrp/` package boundaries around the validated calculations.
